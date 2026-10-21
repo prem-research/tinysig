@@ -158,6 +158,59 @@ fn trust_metadata_authority_windows_are_enforced() {
 }
 
 #[test]
+fn authority_end_is_inclusive() {
+    let mut root: Value = serde_json::from_slice(ROOT).unwrap();
+    for key in ["certificateAuthorities", "timestampAuthorities"] {
+        let authority = root[key].as_array_mut().unwrap().last_mut().unwrap();
+        authority["validFor"]["start"] = json!("2026-10-20T23:13:22Z");
+        authority["validFor"]["end"] = json!("2026-10-20T23:13:22Z");
+    }
+    let roots = TrustedRoot::from_json(&serde_json::to_vec(&root).unwrap()).unwrap();
+    verify(ARTIFACT, BUNDLE, &roots, &policy()).unwrap();
+    root["timestampAuthorities"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["validFor"] = json!({
+        "start": "2026-10-01T00:00:00Z",
+        "end": "2026-10-20T23:13:21Z"
+    });
+    let roots = TrustedRoot::from_json(&serde_json::to_vec(&root).unwrap()).unwrap();
+    assert_eq!(
+        verify(ARTIFACT, BUNDLE, &roots, &policy()),
+        Err(Error::Trust)
+    );
+}
+
+#[test]
+fn dsse_url_safe_base64_and_unknown_fields_verify() {
+    let roots = TrustedRoot::from_json(ROOT).unwrap();
+    let bundle = changed(|v| {
+        let sig = v["dsseEnvelope"]["signatures"][0]["sig"]
+            .as_str()
+            .unwrap()
+            .replace('+', "-")
+            .replace('/', "_");
+        assert_ne!(sig, v["dsseEnvelope"]["signatures"][0]["sig"]);
+        v["dsseEnvelope"]["signatures"][0]["sig"] = json!(sig.trim_end_matches('='));
+        v["dsseEnvelope"]["signatures"][0]["futureField"] = json!("ignored");
+        v["dsseEnvelope"]["futureField"] = json!("ignored");
+    });
+    verify(ARTIFACT, &bundle, &roots, &policy()).unwrap();
+
+    // Ignoring unknown fields must not make consumed fields ambiguous.
+    let text = String::from_utf8(bundle).unwrap().replacen(
+        "\"payloadType\":",
+        "\"payloadType\":\"other\",\"payloadType\":",
+        1,
+    );
+    assert_eq!(
+        verify(ARTIFACT, text.as_bytes(), &roots, &policy()),
+        Err(Error::Encoding)
+    );
+}
+
+#[test]
 fn malformed_and_oversized_inputs_do_not_verify() {
     let roots = TrustedRoot::from_json(ROOT).unwrap();
     for bytes in [b"".as_slice(), b"null", b"{}", b"[]", b"\xff"] {

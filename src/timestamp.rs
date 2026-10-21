@@ -1,19 +1,22 @@
 //! The RFC 3161 / CMS subset emitted by GitHub's timestamp service.
 //! ASN.1 parsing and DER canonicalization are provided by RustCrypto `der`.
 use crate::{
-    Error, TrustedRoot,
-    certificate::TIMESTAMPING,
+    Error,
+    certificate::{Authority, TIMESTAMPING},
     crypto::{self, oid},
     error::Result,
 };
 use alloc::vec::Vec;
 use der::{
     Decode, Encode, Sequence, ValueOrd,
-    asn1::{Any, GeneralizedTime, ObjectIdentifier, OctetString, SetOfVec, Uint},
+    asn1::{Any, BitString, GeneralizedTime, ObjectIdentifier, OctetString, SetOfVec, Uint},
 };
 use x509_cert::{
     attr::Attributes,
-    ext::pkix::name::{GeneralName, GeneralNames},
+    ext::pkix::{
+        SubjectAltName,
+        name::{GeneralName, GeneralNames},
+    },
     name::Name,
     serial_number::SerialNumber,
     spki::AlgorithmIdentifierOwned,
@@ -30,6 +33,8 @@ struct Response {
 #[derive(Clone, Debug, Sequence)]
 struct Status {
     status: u8,
+    status_string: Option<Vec<alloc::string::String>>,
+    fail_info: Option<BitString>,
 }
 #[derive(Clone, Debug, Sequence)]
 struct ContentInfo {
@@ -42,8 +47,8 @@ struct SignedData {
     version: u8,
     digest_algorithms: SetOfVec<AlgorithmIdentifierOwned>,
     content: EncapsulatedContent,
-    // GitHub emits an empty certificate set. Only the caller's pinned TSA
-    // certificate is usable, so nonempty embedded certificate sets are rejected.
+    // Embedded certificates are never used: only a pinned TSA leaf can sign.
+    // The GitHub profile rejects them; the public instance always embeds them.
     #[asn1(
         context_specific = "0",
         tag_mode = "IMPLICIT",
@@ -86,7 +91,7 @@ struct TstInfo {
     ordering: bool,
     nonce: Option<Uint>,
     #[asn1(context_specific = "0", tag_mode = "EXPLICIT", optional = "true")]
-    tsa: Option<Any>,
+    tsa: Option<GeneralName>,
 }
 #[derive(Clone, Debug, Sequence)]
 struct Accuracy {
@@ -118,19 +123,31 @@ struct EssIssuerSerial {
 }
 
 /// Authenticates timestamp contents before returning any time from the token.
-pub(crate) fn verify(bytes: &[u8], signature: &[u8], roots: &TrustedRoot, now: u64) -> Result<u64> {
+pub(crate) fn verify(
+    bytes: &[u8],
+    signature: &[u8],
+    authorities: &[Authority],
+    now: u64,
+    embedded_certificates: bool,
+) -> Result<u64> {
     if bytes.len() > 32 * 1024 {
         return Err(Error::Limit);
     }
     let response = Response::from_der(bytes)?;
     let data = &response.token.content;
-    if response.status.status != 0
+    if !matches!(response.status.status, 0 | 1)
+        || response
+            .status
+            .status_string
+            .as_ref()
+            .is_some_and(|text| text.is_empty())
+        || response.status.fail_info.is_some()
         || response.token.content_type != SIGNED_DATA
         || data.version != 3
         || data.content.content_type != TST_INFO
         || data.signer_infos.len() != 1
         || data.digest_algorithms.len() != 1
-        || data.certificates.as_ref().is_some_and(|c| !c.is_empty())
+        || (!embedded_certificates && data.certificates.as_ref().is_some_and(|c| !c.is_empty()))
     {
         return Err(Error::Unsupported);
     }
@@ -213,7 +230,7 @@ pub(crate) fn verify(bytes: &[u8], signature: &[u8], roots: &TrustedRoot, now: u
             return Err(Error::Unsupported);
         }
     }
-    for authority in &roots.tsa {
+    for authority in authorities {
         let leaf = &authority.chain[0];
         if signer.sid.issuer != leaf.tbs_certificate.issuer
             || signer.sid.serial != leaf.tbs_certificate.serial_number
@@ -230,6 +247,16 @@ pub(crate) fn verify(bytes: &[u8], signature: &[u8], roots: &TrustedRoot, now: u
                         leaf.tbs_certificate.issuer.clone(),
                     )]
             {
+                continue;
+            }
+        }
+        if let Some(tsa) = &info.tsa {
+            let subject = GeneralName::DirectoryName(leaf.tbs_certificate.subject.clone());
+            let san_matches = leaf
+                .tbs_certificate
+                .get::<SubjectAltName>()?
+                .is_some_and(|(_, sans)| sans.0.contains(tsa));
+            if tsa != &subject && !san_matches {
                 continue;
             }
         }
@@ -251,6 +278,7 @@ pub(crate) fn verify(bytes: &[u8], signature: &[u8], roots: &TrustedRoot, now: u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TrustedRoot;
 
     fn fixture() -> (Response, Vec<u8>) {
         let bundle: crate::Bundle =
@@ -321,8 +349,9 @@ mod tests {
         verify(
             &response.to_der().unwrap(),
             &signature,
-            &roots,
+            &roots.tsa,
             1_792_627_200,
+            false,
         )
         .unwrap();
 
@@ -332,8 +361,9 @@ mod tests {
             verify(
                 &wrong_binding.to_der().unwrap(),
                 &signature,
-                &roots,
-                1_792_627_200
+                &roots.tsa,
+                1_792_627_200,
+                false
             ),
             Err(Error::Trust)
         );
@@ -348,8 +378,9 @@ mod tests {
             verify(
                 &response.to_der().unwrap(),
                 &signature,
-                &roots,
-                1_792_627_200
+                &roots.tsa,
+                1_792_627_200,
+                false
             ),
             Err(Error::Timestamp)
         );
@@ -370,8 +401,9 @@ mod tests {
             verify(
                 &response.to_der().unwrap(),
                 &signature,
-                &roots,
-                1_792_627_200
+                &roots.tsa,
+                1_792_627_200,
+                false
             ),
             Err(Error::Timestamp)
         );
@@ -387,8 +419,9 @@ mod tests {
             verify(
                 &response.to_der().unwrap(),
                 &signature,
-                &roots,
-                1_792_627_200
+                &roots.tsa,
+                1_792_627_200,
+                false
             ),
             Err(Error::Trust)
         );
@@ -416,5 +449,83 @@ mod tests {
             .unwrap()
             .decode_as::<SigningCertificateV2>()
             .unwrap();
+    }
+
+    #[test]
+    fn granted_with_mods_and_status_text_keep_the_signed_token_valid() {
+        let roots =
+            TrustedRoot::from_json(include_bytes!("../tests/fixtures/github-trusted-root.json"))
+                .unwrap();
+        let (mut response, signature) = fixture();
+        response.status.status = 1;
+        response.status.status_string = Some(alloc::vec!["request modified".into()]);
+        verify(
+            &response.to_der().unwrap(),
+            &signature,
+            &roots.tsa,
+            1_792_627_200,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn embedded_certificates_are_profile_dependent_and_never_trusted() {
+        let roots =
+            TrustedRoot::from_json(include_bytes!("../tests/fixtures/github-trusted-root.json"))
+                .unwrap();
+        let (mut response, signature) = fixture();
+        let leaf = Any::from_der(&roots.tsa[0].chain[0].to_der().unwrap()).unwrap();
+        response.token.content.certificates = Some(SetOfVec::try_from(alloc::vec![leaf]).unwrap());
+        let der = response.to_der().unwrap();
+        assert_eq!(
+            verify(&der, &signature, &roots.tsa, 1_792_627_200, false),
+            Err(Error::Unsupported)
+        );
+        verify(&der, &signature, &roots.tsa, 1_792_627_200, true).unwrap();
+        // An embedded certificate does not stand in for a pinned authority.
+        assert_eq!(
+            verify(&der, &signature, &[], 1_792_627_200, true),
+            Err(Error::Trust)
+        );
+    }
+
+    #[test]
+    fn signed_tsa_name_must_match_the_pinned_certificate() {
+        let (roots, key) = crate::certificate::test_roots();
+        let (mut response, signature) = fixture();
+        let tsa_subject = roots.tsa.last().unwrap().chain[0]
+            .tbs_certificate
+            .subject
+            .clone();
+        let mut info =
+            TstInfo::from_der(response.token.content.content.content.as_bytes()).unwrap();
+        info.tsa = Some(GeneralName::DirectoryName(tsa_subject));
+        response.token.content.content.content = OctetString::new(info.to_der().unwrap()).unwrap();
+        resign(&mut response, &roots, &key, true);
+        verify(
+            &response.to_der().unwrap(),
+            &signature,
+            &roots.tsa,
+            1_792_627_200,
+            false,
+        )
+        .unwrap();
+
+        info.tsa = Some(GeneralName::UniformResourceIdentifier(
+            der::asn1::Ia5String::new("https://attacker.example/tsa").unwrap(),
+        ));
+        response.token.content.content.content = OctetString::new(info.to_der().unwrap()).unwrap();
+        resign(&mut response, &roots, &key, true);
+        assert_eq!(
+            verify(
+                &response.to_der().unwrap(),
+                &signature,
+                &roots.tsa,
+                1_792_627_200,
+                false,
+            ),
+            Err(Error::Trust)
+        );
     }
 }
