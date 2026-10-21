@@ -64,6 +64,15 @@ pub(crate) struct Authority {
     end: Option<u64>,
 }
 
+impl Authority {
+    pub(crate) fn new(chain: Vec<Certificate>, start: u64, end: Option<u64>) -> Result<Self> {
+        if chain.is_empty() || chain.len() > 4 || end.is_some_and(|end| end < start) {
+            return Err(Error::Encoding);
+        }
+        Ok(Self { chain, start, end })
+    }
+}
+
 /// GitHub Sigstore authority metadata, embedded or supplied by the caller.
 ///
 /// Use [`Self::embedded`] for the built-in snapshot or parse the **GitHub instance**
@@ -123,10 +132,7 @@ impl TrustedRoot {
                         .collect::<Result<Vec<_>>>()?;
                     let start = parse_time(&a.valid_for.start)?;
                     let end = a.valid_for.end.as_deref().map(parse_time).transpose()?;
-                    if end.is_some_and(|end| end <= start) {
-                        return Err(Error::Encoding);
-                    }
-                    Ok(Authority { chain, start, end })
+                    Authority::new(chain, start, end)
                 })
                 .collect()
         }
@@ -138,28 +144,43 @@ impl TrustedRoot {
 }
 
 fn parse_time(s: &str) -> Result<u64> {
+    if s.len() != 20 {
+        return Err(Error::Encoding);
+    }
+    Ok(parse_rfc3339(s)?.0)
+}
+
+/// Parse `YYYY-MM-DDTHH:MM:SS[.fraction]Z` into Unix seconds and nanoseconds.
+pub(crate) fn parse_rfc3339(s: &str) -> Result<(u64, u32)> {
     let b = s.as_bytes();
-    if b.len() != 20
+    if b.len() < 20
         || b[4] != b'-'
         || b[7] != b'-'
         || b[10] != b'T'
         || b[13] != b':'
         || b[16] != b':'
-        || b[19] != b'Z'
+        || b[b.len() - 1] != b'Z'
     {
         return Err(Error::Encoding);
     }
-    fn number(b: &[u8]) -> Result<u16> {
-        b.iter().try_fold(0u16, |n, b| {
+    fn number(b: &[u8]) -> Result<u32> {
+        b.iter().try_fold(0u32, |n, b| {
             if b.is_ascii_digit() {
-                Ok(n * 10 + u16::from(b - b'0'))
+                Ok(n * 10 + u32::from(b - b'0'))
             } else {
                 Err(Error::Encoding)
             }
         })
     }
-    Ok(der::DateTime::new(
-        number(&b[..4])?,
+    let nanos = match &b[19..b.len() - 1] {
+        [] => 0,
+        [b'.', digits @ ..] if (1..=9).contains(&digits.len()) => {
+            number(digits)? * 10u32.pow(9 - digits.len() as u32)
+        }
+        _ => return Err(Error::Encoding),
+    };
+    let secs = der::DateTime::new(
+        number(&b[..4])? as u16,
         number(&b[5..7])? as u8,
         number(&b[8..10])? as u8,
         number(&b[11..13])? as u8,
@@ -167,7 +188,8 @@ fn parse_time(s: &str) -> Result<u64> {
         number(&b[17..19])? as u8,
     )?
     .unix_duration()
-    .as_secs())
+    .as_secs();
+    Ok((secs, nanos))
 }
 
 pub(crate) fn parse(bytes: &[u8]) -> Result<Certificate> {
@@ -248,14 +270,15 @@ fn usage(cert: &Certificate, purpose: ObjectIdentifier, ca: bool, ca_below: usiz
         None if !ca => return Err(Error::Trust),
         None => (),
     }
-    // Only URI SANs are supported. In this profile SAN constraints are checked
-    // against an exact expected workflow, never DNS/wildcard matching.
+    // Only URI and email SANs are supported. SAN constraints are checked against
+    // an exact expected identity, never DNS/wildcard matching.
     if let Some((_, sans)) = tbs.get::<SubjectAltName>()? {
-        if sans
-            .0
-            .iter()
-            .any(|n| !matches!(n, GeneralName::UniformResourceIdentifier(_)))
-        {
+        if sans.0.iter().any(|n| {
+            !matches!(
+                n,
+                GeneralName::UniformResourceIdentifier(_) | GeneralName::Rfc822Name(_)
+            )
+        }) {
             return Err(Error::Unsupported);
         }
     }
@@ -284,7 +307,7 @@ impl Authority {
         time: u64,
         purpose: ObjectIdentifier,
     ) -> Result<()> {
-        if time < self.start || self.end.is_some_and(|end| time >= end) {
+        if time < self.start || self.end.is_some_and(|end| time > end) {
             return Err(Error::Trust);
         }
         let tsa = purpose == TIMESTAMPING;

@@ -9,6 +9,7 @@ mod certificate;
 mod crypto;
 mod error;
 mod policy;
+pub mod public;
 mod timestamp;
 
 use alloc::{format, string::String, vec::Vec};
@@ -18,7 +19,6 @@ use error::Result;
 pub use policy::{Policy, PolicyBuilder, RunnerEnvironment};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use x509_cert::spki::AlgorithmIdentifierOwned;
 
 /// Authenticated release information, returned only after all checks succeed.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,8 +91,9 @@ pub fn verify_digest(
                 .signed_timestamp,
         )?,
         &signature,
-        roots,
+        &roots.tsa,
         policy.not_after,
+        false,
     )?;
     if !roots
         .fulcio
@@ -106,22 +107,10 @@ pub fn verify_digest(
     }
     let identity = certificate::identity(&cert, policy)?;
     let payload = crypto::b64(&envelope.payload)?;
-    // DSSE PAE lengths are byte lengths, and the signature covers the original
-    // payload bytes, never a JSON reconstruction.
-    let mut pae = format!(
-        "DSSEv1 {} {} {} ",
-        envelope.payload_type.len(),
-        envelope.payload_type,
-        payload.len()
-    )
-    .into_bytes();
-    pae.extend_from_slice(&payload);
+    let pae = pae(&envelope.payload_type, &payload);
     crypto::verify(
         &cert.tbs_certificate.subject_public_key_info,
-        &AlgorithmIdentifierOwned {
-            oid: crypto::oid("1.2.840.10045.4.3.2"),
-            parameters: None,
-        },
+        &crypto::ecdsa_sha256(),
         &pae,
         &signature,
     )?;
@@ -156,6 +145,20 @@ pub fn verify_digest(
         source_revision: identity.source_revision,
         source_ref: identity.git_ref,
     })
+}
+
+/// DSSE PAE lengths are byte lengths, and the signature covers the original
+/// payload bytes, never a JSON reconstruction.
+fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
+    let mut pae = format!(
+        "DSSEv1 {} {} {} ",
+        payload_type.len(),
+        payload_type,
+        payload.len()
+    )
+    .into_bytes();
+    pae.extend_from_slice(payload);
+    pae
 }
 
 fn verify_provenance(
@@ -224,14 +227,13 @@ struct Timestamp {
     signed_timestamp: String,
 }
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct Envelope {
     payload: String,
     payload_type: String,
     signatures: Vec<Signature>,
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Signature {
     sig: String,
     #[serde(default)]
