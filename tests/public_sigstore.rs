@@ -1,7 +1,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use trustbase_sigstore::{Error, public::PublicVerifier};
+use tinysig::{Error, public::PublicVerifier};
 
 const ARTIFACT: &[u8] = include_bytes!("fixtures/upstream/a.txt");
 const IDENTITY: &str = "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main";
@@ -109,7 +109,7 @@ fn wrong_root_and_oversize_input_fail() {
         Err(Error::Limit)
     );
     // The GitHub private-instance root has no Rekor or CT logs.
-    assert!(PublicVerifier::from_json(trustbase_sigstore::EMBEDDED_GITHUB_TRUST_ROOT).is_err());
+    assert!(PublicVerifier::from_json(tinysig::EMBEDDED_GITHUB_TRUST_ROOT).is_err());
 }
 
 #[test]
@@ -316,4 +316,168 @@ fn signatures_are_checked_before_log_bindings() {
             flip(&b["dsseEnvelope"]["signatures"][0]["sig"]);
     });
     assert_eq!(verify(V2_DSSE_ROOT, &dsse), Err(Error::Signature));
+}
+
+#[test]
+fn dsse_envelope_shape_is_enforced_on_the_public_path() {
+    let two = edit(V1_DSSE, |b| {
+        let sig = b["dsseEnvelope"]["signatures"][0].clone();
+        b["dsseEnvelope"]["signatures"]
+            .as_array_mut()
+            .unwrap()
+            .push(sig);
+    });
+    assert_eq!(verify(PUBLIC_ROOT, &two), Err(Error::Unsupported));
+    let none = edit(V1_DSSE, |b| b["dsseEnvelope"]["signatures"] = json!([]));
+    assert_eq!(verify(PUBLIC_ROOT, &none), Err(Error::Unsupported));
+    let other = edit(V1_DSSE, |b| {
+        b["dsseEnvelope"]["payloadType"] = "text/plain".into()
+    });
+    assert_eq!(verify(PUBLIC_ROOT, &other), Err(Error::Unsupported));
+    let both = edit(V1_DSSE, |b| {
+        b["messageSignature"] = json!({"signature": b["dsseEnvelope"]["signatures"][0]["sig"]});
+    });
+    assert_eq!(verify(PUBLIC_ROOT, &both), Err(Error::Unsupported));
+}
+
+#[test]
+fn evidence_count_limits_are_inclusive() {
+    let entries = |n: usize| {
+        edit(V1_MESSAGE, |b| {
+            let entry = b["verificationMaterial"]["tlogEntries"][0].clone();
+            b["verificationMaterial"]["tlogEntries"] = Value::Array(vec![entry; n]);
+        })
+    };
+    assert_eq!(verify(PUBLIC_ROOT, &entries(16)), Ok(vec![1_710_869_186]));
+    assert_eq!(verify(PUBLIC_ROOT, &entries(17)), Err(Error::Limit));
+    let stamps = |n: usize| {
+        edit(V2_MESSAGE, |b| {
+            let data = &mut b["verificationMaterial"]["timestampVerificationData"];
+            let stamp = data["rfc3161Timestamps"][0].clone();
+            data["rfc3161Timestamps"] = Value::Array(vec![stamp; n]);
+        })
+    };
+    assert_eq!(verify(V2_MESSAGE_ROOT, &stamps(4)), Ok(vec![1_749_729_740]));
+    assert_eq!(verify(V2_MESSAGE_ROOT, &stamps(5)), Err(Error::Limit));
+}
+
+#[test]
+fn trust_roots_need_every_log_kind_and_consistent_ct_ids() {
+    for key in ["tlogs", "ctlogs", "certificateAuthorities"] {
+        let root = edit(PUBLIC_ROOT, |r| r[key] = json!([]));
+        assert_eq!(
+            PublicVerifier::from_json(&root).err(),
+            Some(Error::Unsupported),
+            "{key}"
+        );
+    }
+    let logs = |n: usize| {
+        edit(PUBLIC_ROOT, |r| {
+            let log = r["tlogs"][0].clone();
+            r["tlogs"] = Value::Array(vec![log; n]);
+        })
+    };
+    assert_eq!(verify(&logs(16), V1_MESSAGE), Ok(vec![1_710_869_186]));
+    assert_eq!(
+        PublicVerifier::from_json(&logs(17)).err(),
+        Some(Error::Limit)
+    );
+    // Authority chains carry at most four certificates.
+    let chain = |n: usize| {
+        edit(PUBLIC_ROOT, |r| {
+            let certificates = r["certificateAuthorities"][0]["certChain"]["certificates"]
+                .as_array()
+                .unwrap()
+                .clone();
+            r["certificateAuthorities"][0]["certChain"]["certificates"] =
+                Value::Array(certificates.iter().cycle().take(n).cloned().collect());
+        })
+    };
+    assert!(PublicVerifier::from_json(&chain(4)).is_ok());
+    assert_eq!(
+        PublicVerifier::from_json(&chain(5)).err(),
+        Some(Error::Limit)
+    );
+    // A CT log ID is the SHA-256 of its key; anything else is a malformed root.
+    let wrong_id = edit(PUBLIC_ROOT, |r| {
+        r["ctlogs"][0]["logId"]["keyId"] = STANDARD.encode([7u8; 32]).into();
+    });
+    assert_eq!(
+        PublicVerifier::from_json(&wrong_id).err(),
+        Some(Error::Encoding)
+    );
+    let short_id = edit(PUBLIC_ROOT, |r| {
+        r["tlogs"][0]["logId"]["keyId"] = STANDARD.encode([7u8; 31]).into();
+    });
+    assert_eq!(
+        PublicVerifier::from_json(&short_id).err(),
+        Some(Error::Encoding)
+    );
+}
+
+#[test]
+fn v02_certificate_chains_carry_one_to_four_certificates() {
+    let v02 = |n: usize| {
+        edit(V1_MESSAGE, |b| {
+            b["mediaType"] = "application/vnd.dev.sigstore.bundle+json;version=0.2".into();
+            let material = b["verificationMaterial"].as_object_mut().unwrap();
+            let leaf = material.remove("certificate").unwrap();
+            material.insert(
+                "x509CertificateChain".into(),
+                json!({"certificates": vec![leaf; n]}),
+            );
+        })
+    };
+    assert_eq!(verify(PUBLIC_ROOT, &v02(1)), Ok(vec![1_710_869_186]));
+    assert_eq!(verify(PUBLIC_ROOT, &v02(4)), Ok(vec![1_710_869_186]));
+    assert_eq!(verify(PUBLIC_ROOT, &v02(0)), Err(Error::Unsupported));
+    assert_eq!(verify(PUBLIC_ROOT, &v02(5)), Err(Error::Unsupported));
+}
+
+#[test]
+fn log_windows_round_fractional_seconds_inward() {
+    // The production message entry was integrated at 2024-03-19T17:26:26Z.
+    for (start, expected) in [
+        ("2024-03-19T17:26:26Z", Ok(vec![1_710_869_186])),
+        ("2024-03-19T17:26:26.000Z", Ok(vec![1_710_869_186])),
+        ("2024-03-19T17:26:26.001Z", Err(Error::Trust)),
+        ("2024-03-19T17:26:25.999Z", Ok(vec![1_710_869_186])),
+    ] {
+        let root = edit(PUBLIC_ROOT, |r| {
+            for log in r["tlogs"].as_array_mut().unwrap() {
+                log["publicKey"]["validFor"]["start"] = start.into();
+            }
+        });
+        assert_eq!(verify(&root, V1_MESSAGE), expected, "{start}");
+    }
+    for (end, expected) in [
+        ("2024-03-19T17:26:26Z", Ok(vec![1_710_869_186])),
+        ("2024-03-19T17:26:26.999Z", Ok(vec![1_710_869_186])),
+        ("2024-03-19T17:26:25.999Z", Err(Error::Trust)),
+    ] {
+        let root = edit(PUBLIC_ROOT, |r| {
+            for log in r["tlogs"].as_array_mut().unwrap() {
+                log["publicKey"]["validFor"]["end"] = end.into();
+            }
+        });
+        assert_eq!(verify(&root, V1_MESSAGE), expected, "{end}");
+    }
+}
+
+#[test]
+fn fulcio_authority_windows_round_fractional_starts_up() {
+    // Signing time 2024-03-19T17:26:26Z: a window starting in that second is
+    // inclusive, a window starting one millisecond later is not.
+    for (start, expected) in [
+        ("2024-03-19T17:26:26Z", Ok(vec![1_710_869_186])),
+        ("2024-03-19T17:26:26.000Z", Ok(vec![1_710_869_186])),
+        ("2024-03-19T17:26:26.001Z", Err(Error::Trust)),
+    ] {
+        // Only the current authority: retired ones end before 2024.
+        let root = edit(PUBLIC_ROOT, |r| {
+            let authorities = r["certificateAuthorities"].as_array_mut().unwrap();
+            authorities.last_mut().unwrap()["validFor"]["start"] = start.into();
+        });
+        assert_eq!(verify(&root, V1_MESSAGE), expected, "{start}");
+    }
 }

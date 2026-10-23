@@ -10,11 +10,9 @@ TLS, or filesystem use.
 - Fail-closed: unsupported formats and algorithms are rejected, never skipped,
   and errors return no partially verified data.
 
-The package is currently published as `trustbase-sigstore`:
-
 ```toml
 [dependencies]
-trustbase-sigstore = { path = "../tinysig" }
+tinysig = { path = "../tinysig" }
 ```
 
 ## Two verifiers
@@ -40,7 +38,7 @@ caller. Supply it from a trusted clock or release policy, never from the bundle.
 ## GitHub artifact attestations
 
 ```rust,no_run
-use trustbase_sigstore::{Policy, TrustedRoot, verify};
+use tinysig::{Policy, TrustedRoot, verify};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let roots = TrustedRoot::embedded()?;
 let policy = Policy::builder()
@@ -80,8 +78,8 @@ Pin an immutable source commit, repository/owner IDs, runner classification,
 trigger, and an inclusive signing-time interval when you know them:
 
 ```rust,no_run
-use trustbase_sigstore::{Policy, RunnerEnvironment};
-# fn example() -> Result<(), trustbase_sigstore::Error> {
+use tinysig::{Policy, RunnerEnvironment};
+# fn example() -> Result<(), tinysig::Error> {
 let policy = Policy::builder()
     .repository("example/project")
     .workflow_path(".github/workflows/build.yaml")
@@ -103,8 +101,8 @@ let policy = Policy::builder()
 Permit an explicit set of refs, for example during a release transition:
 
 ```rust,no_run
-# use trustbase_sigstore::Policy;
-# fn example() -> Result<(), trustbase_sigstore::Error> {
+# use tinysig::Policy;
+# fn example() -> Result<(), tinysig::Error> {
 let policy = Policy::builder()
     .repository("example/project")
     .git_ref("refs/tags/v1.2.0")
@@ -154,7 +152,7 @@ refresh procedure.
 After an authority rotation, update the crate or supply authenticated metadata:
 
 ```rust,no_run
-use trustbase_sigstore::TrustedRoot;
+use tinysig::TrustedRoot;
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
 let roots = TrustedRoot::from_json(&std::fs::read("github-trusted-root.json")?)?;
 # let _ = roots;
@@ -223,7 +221,7 @@ Rekor evidence, so this path makes no public transparency claim.
 
 ```rust,no_run
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
-use trustbase_sigstore::public::PublicVerifier;
+use tinysig::public::PublicVerifier;
 let verifier = PublicVerifier::from_json(&std::fs::read("public-trusted-root.json")?)?;
 let result = verifier.verify(
     &std::fs::read("artifact.txt")?,
@@ -294,7 +292,7 @@ claim about that digest.
 ```rust,no_run
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use trustbase_sigstore::{Policy, TrustedRoot, verify_digest};
+use tinysig::{Policy, TrustedRoot, verify_digest};
 # fn example(mut archive: impl Read, bundle: &[u8], roots: &TrustedRoot, policy: &Policy) -> Result<(), Box<dyn std::error::Error>> {
 let mut hash = Sha256::new();
 let mut buffer = [0u8; 64 * 1024];
@@ -388,7 +386,9 @@ Tests cover a real GitHub attestation fixture, byte-for-byte upstream Sigstore
 conformance bundles (production Rekor v1 and staging Rekor v2, with DSSE and
 message signatures, plus malformed log/envelope cases), and tampered artifacts,
 payloads, signatures, timestamps, checkpoints, log IDs, and trust-root windows.
-Synthetically re-signed certificates and timestamps test failure paths. Fixtures
+Synthetically re-signed certificates and timestamps test failure paths, and
+`tests/forged_public_pki.rs` mints public-path bundles under a test-only Fulcio
+chain, CT log, and Rekor log to break one invariant at a time. Fixtures
 use expired short-lived certificates intentionally: authenticated signing-time
 validation keeps historical artifacts verifiable. Fixture provenance is recorded
 in [`tests/fixtures/README.md`](tests/fixtures/README.md) and
@@ -405,7 +405,7 @@ defaults (repository `prem-research/trustbase`, workflow
 Trustbase consumer only names the release and artifact:
 
 ```rust,no_run
-use trustbase_sigstore::{Policy, TrustedRoot, verify};
+use tinysig::{Policy, TrustedRoot, verify};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let policy = Policy::builder()
     .release_tag("v1.0.0")

@@ -558,7 +558,17 @@ mod tests {
     fn canonical_numbers_and_fractional_windows() {
         assert_eq!(number("0"), Ok(0));
         assert_eq!(number("1734374576"), Ok(1_734_374_576));
-        for bad in ["", "01", "+1", "-1", "1.0", "18446744073709551616"] {
+        assert_eq!(number("18446744073709551615"), Ok(u64::MAX));
+        for bad in [
+            "",
+            "01",
+            "+1",
+            "-1",
+            "1.0",
+            "18446744073709551616",
+            "000000000000000000001",
+            "100000000000000000000",
+        ] {
             assert_eq!(number(bad), Err(Error::Encoding), "{bad}");
         }
         let period = PeriodJson {
@@ -570,7 +580,188 @@ mod tests {
             Ok((1_666_224_001, Some(1_667_260_799)))
         );
         assert!(parse_time("2022-10-20T00:00:00.Z").is_err());
+        // Each separator position is checked on its own.
+        let good = "2022-10-20T00:00:00Z";
+        for position in [4, 7, 10, 13, 16, 19] {
+            let mut bad = good.as_bytes().to_vec();
+            bad[position] = b'0';
+            assert!(
+                parse_time(core::str::from_utf8(&bad).unwrap()).is_err(),
+                "position {position}"
+            );
+        }
+        assert!(parse_time("2022-10-20 00:00:00Z").is_err());
+        assert!(parse_time("2022-10-20T00:00:00+00:00").is_err());
+        assert!(parse_time("2022-10-20T00:00:0Z").is_err());
+        assert_eq!(parse_time(good), Ok((1_666_224_000, 0)));
+        assert!(parse_time("2022-10-20T00:00:00.123456789Z").is_ok());
+        assert_eq!(
+            parse_time("2022-10-20T00:00:00.1234567890Z"),
+            Err(Error::Encoding)
+        );
+        assert_eq!(
+            parse_time(&"2022-10-20T00:00:00Z".repeat(2)),
+            Err(Error::Encoding)
+        );
+        // A log whose window ends before it starts is malformed metadata.
+        let root = edit_root(|r| {
+            r["tlogs"][0]["publicKey"]["validFor"]["start"] = "2024-01-01T00:00:00.5Z".into();
+            r["tlogs"][0]["publicKey"]["validFor"]["end"] = "2024-01-01T00:00:00.4Z".into();
+        });
+        assert_eq!(
+            PublicVerifier::from_json(&root).err(),
+            Some(Error::Encoding)
+        );
+        let root = edit_root(|r| {
+            r["tlogs"][0]["publicKey"]["validFor"]["start"] = "2024-01-01T00:00:00.5Z".into();
+            r["tlogs"][0]["publicKey"]["validFor"]["end"] = "2024-01-01T00:00:00.5Z".into();
+        });
+        assert!(PublicVerifier::from_json(&root).is_ok());
         assert!(parse_time("2022-10-20T00:00:00.0000000001Z").is_err());
+    }
+
+    #[test]
+    fn subject_statements_are_bounded_and_typed() {
+        let digest = [0xabu8; 32];
+        let hex = crypto::hex(&digest);
+        let statement = |kind: &str, subjects: alloc::vec::Vec<serde_json::Value>| {
+            serde_json::to_vec(&serde_json::json!({
+                "_type": kind, "subject": subjects, "predicateType": "x", "predicate": {}
+            }))
+            .unwrap()
+        };
+        let subject = |sha256: &str| serde_json::json!({"name": "a", "digest": {"sha256": sha256}});
+        let v1 = "https://in-toto.io/Statement/v1";
+        check_subject(&statement(v1, alloc::vec![subject(&hex)]), &digest).unwrap();
+        check_subject(
+            &statement(
+                "https://in-toto.io/Statement/v0.1",
+                alloc::vec![subject(&hex)],
+            ),
+            &digest,
+        )
+        .unwrap();
+        assert_eq!(
+            check_subject(
+                &statement(
+                    "https://in-toto.io/Statement/v2",
+                    alloc::vec![subject(&hex)]
+                ),
+                &digest
+            ),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(
+            check_subject(&statement(v1, alloc::vec![]), &digest),
+            Err(Error::Limit)
+        );
+        let mut many: alloc::vec::Vec<_> = (0..63).map(|_| subject("00")).collect();
+        many.push(subject(&hex));
+        check_subject(&statement(v1, many.clone()), &digest).unwrap();
+        many.insert(0, subject("00"));
+        assert_eq!(
+            check_subject(&statement(v1, many), &digest),
+            Err(Error::Limit)
+        );
+        assert_eq!(
+            check_subject(&statement(v1, alloc::vec![subject("00")]), &digest),
+            Err(Error::Artifact)
+        );
+        assert_eq!(
+            check_subject(
+                &statement(v1, alloc::vec![subject(&hex.to_uppercase())]),
+                &digest
+            ),
+            Err(Error::Artifact)
+        );
+        let no_sha256 = serde_json::json!({"name": "a", "digest": {"sha512": "00"}});
+        assert_eq!(
+            check_subject(&statement(v1, alloc::vec![no_sha256]), &digest),
+            Err(Error::Artifact)
+        );
+    }
+
+    #[test]
+    fn log_keys_are_typed_by_key_details() {
+        use der::Encode;
+        let ed25519 = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let spki = |oid: &str, parameters: bool, key: &[u8]| {
+            let algorithm = x509_cert::spki::AlgorithmIdentifierOwned {
+                oid: crypto::oid(oid),
+                parameters: parameters.then(der::asn1::Any::null),
+            };
+            SubjectPublicKeyInfoOwned {
+                algorithm,
+                subject_public_key: der::asn1::BitString::from_bytes(key).unwrap(),
+            }
+            .to_der()
+            .unwrap()
+        };
+        let log = |details: &str, der: &[u8], ct: bool| {
+            use base64::{Engine, engine::general_purpose::STANDARD};
+            let id = Sha256::digest(der);
+            Log::parse(
+                LogJson {
+                    public_key: PublicKeyJson {
+                        raw_bytes: STANDARD.encode(der),
+                        key_details: details.into(),
+                        valid_for: PeriodJson {
+                            start: "2020-01-01T00:00:00Z".into(),
+                            end: None,
+                        },
+                    },
+                    log_id: LogIdJson {
+                        key_id: STANDARD.encode(id),
+                    },
+                },
+                ct,
+            )
+        };
+        let good = spki("1.3.101.112", false, ed25519.as_bytes());
+        assert!(log("PKIX_ED25519", &good, false).unwrap().is_some());
+        // Ed25519 is never accepted for CT logs; unknown details are skipped.
+        assert!(log("PKIX_ED25519", &good, true).unwrap().is_none());
+        assert!(
+            log("PKIX_RSA_PKCS1V15_2048_SHA256", &good, false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            log(
+                "PKIX_ED25519",
+                &spki("1.3.101.113", false, ed25519.as_bytes()),
+                false
+            )
+            .err(),
+            Some(Error::Encoding)
+        );
+        assert_eq!(
+            log(
+                "PKIX_ED25519",
+                &spki("1.3.101.112", true, ed25519.as_bytes()),
+                false
+            )
+            .err(),
+            Some(Error::Encoding)
+        );
+        assert_eq!(
+            log(
+                "PKIX_ED25519",
+                &spki("1.3.101.112", false, &ed25519.as_bytes()[..31]),
+                false
+            )
+            .err(),
+            Some(Error::Encoding)
+        );
+    }
+
+    fn edit_root(change: impl FnOnce(&mut serde_json::Value)) -> alloc::vec::Vec<u8> {
+        let mut root: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/upstream/public-good-root.json"
+        ))
+        .unwrap();
+        change(&mut root);
+        serde_json::to_vec(&root).unwrap()
     }
 
     fn leaf() -> Certificate {
@@ -659,6 +850,18 @@ mod tests {
         let uri =
             GeneralName::UniformResourceIdentifier(der::asn1::Ia5String::new(IDENTITY).unwrap());
         check_identity(&sans(alloc::vec![mailbox.clone()]), email, ISSUER).unwrap();
+        // An email SAN matches only its exact address, never a URI identity.
+        for wrong in ["other@example.com", "Signer@example.com", IDENTITY] {
+            assert_eq!(
+                check_identity(&sans(alloc::vec![mailbox.clone()]), wrong, ISSUER),
+                Err(Error::Identity),
+                "{wrong}"
+            );
+        }
+        assert_eq!(
+            check_identity(&sans(alloc::vec![uri.clone()]), email, ISSUER),
+            Err(Error::Identity)
+        );
         assert_eq!(
             check_identity(&sans(alloc::vec![uri, mailbox]), IDENTITY, ISSUER),
             Err(Error::Identity)

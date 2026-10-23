@@ -315,6 +315,276 @@ struct Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use der::{Encode, asn1::BitString};
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use serde_json::{Value, json};
+
+    fn forged(
+        edit_payload: impl FnOnce(&mut Value),
+        edit_cert: impl FnOnce(&mut x509_cert::Certificate),
+    ) -> (TrustedRoot, Vec<u8>) {
+        let (roots, ca_key) = certificate::test_roots();
+        let mut value: Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/provenance.sigstore.json"))
+                .unwrap();
+        let leaf_key = SigningKey::from_slice(&[5; 32]).unwrap();
+        let raw = value["verificationMaterial"]["certificate"]["rawBytes"]
+            .as_str()
+            .unwrap();
+        let mut cert = certificate::parse(&crypto::b64(raw).unwrap()).unwrap();
+        cert.tbs_certificate
+            .subject_public_key_info
+            .subject_public_key =
+            BitString::from_bytes(leaf_key.verifying_key().to_encoded_point(false).as_bytes())
+                .unwrap();
+        edit_cert(&mut cert);
+        certificate::test_sign(&mut cert, &ca_key);
+        let mut payload: Value = serde_json::from_slice(
+            &crypto::b64(value["dsseEnvelope"]["payload"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        edit_payload(&mut payload);
+        let payload = serde_json::to_vec(&payload).unwrap();
+        let signature: Signature = leaf_key.sign(&pae("application/vnd.in-toto+json", &payload));
+        let signature = signature.to_der().as_bytes().to_vec();
+        let token = timestamp::tests::resigned_for(&signature, &roots, &ca_key);
+        value["verificationMaterial"]["certificate"]["rawBytes"] =
+            STANDARD.encode(cert.to_der().unwrap()).into();
+        value["dsseEnvelope"]["payload"] = STANDARD.encode(&payload).into();
+        value["dsseEnvelope"]["signatures"][0]["sig"] = STANDARD.encode(&signature).into();
+        value["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0]["signedTimestamp"] =
+            STANDARD.encode(token).into();
+        (roots, serde_json::to_vec(&value).unwrap())
+    }
+
+    fn policy() -> Policy {
+        Policy::builder()
+            .release_tag("v1.0.0")
+            .artifact_name("measurements.json")
+            .now_unix_seconds(1_792_627_200)
+            .build()
+            .unwrap()
+    }
+
+    const ARTIFACT: &[u8] = include_bytes!("../tests/fixtures/measurements.json");
+
+    #[test]
+    fn forged_bundle_under_test_authorities_verifies() {
+        let (roots, bundle) = forged(|_| {}, |_| {});
+        let result = verify(ARTIFACT, &bundle, &roots, &policy()).unwrap();
+        assert_eq!(result.signed_at_unix_seconds, 1_792_538_002);
+        assert_eq!(result.source_ref, "refs/tags/v1.0.0");
+    }
+
+    #[test]
+    fn statement_and_predicate_types_are_each_required() {
+        let (roots, bundle) = forged(
+            |p| p["_type"] = json!("https://in-toto.io/Statement/v0.1"),
+            |_| {},
+        );
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Unsupported)
+        );
+        let (roots, bundle) = forged(
+            |p| p["predicateType"] = json!("https://slsa.dev/provenance/v0.2"),
+            |_| {},
+        );
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Unsupported)
+        );
+    }
+
+    #[test]
+    fn subject_list_limits_and_duplicates() {
+        let (roots, bundle) = forged(|p| p["subject"] = json!([]), |_| {});
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Limit)
+        );
+        let (roots, bundle) = forged(
+            |p| {
+                let subject = p["subject"][0].clone();
+                let mut many: Vec<Value> = (0..64)
+                    .map(|i| json!({"name": format!("extra-{i}"), "digest": {"sha256": "00"}}))
+                    .collect();
+                many.push(subject);
+                p["subject"] = Value::Array(many);
+            },
+            |_| {},
+        );
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Limit)
+        );
+        let (roots, bundle) = forged(
+            |p| {
+                let subject = p["subject"][0].clone();
+                let mut many: Vec<Value> = (0..63)
+                    .map(|i| json!({"name": format!("extra-{i}"), "digest": {"sha256": "00"}}))
+                    .collect();
+                many.push(subject);
+                p["subject"] = Value::Array(many);
+            },
+            |_| {},
+        );
+        verify(ARTIFACT, &bundle, &roots, &policy()).unwrap();
+        // The same name twice is ambiguous even when one digest matches.
+        let (roots, bundle) = forged(
+            |p| {
+                let mut other = p["subject"][0].clone();
+                other["digest"]["sha256"] = json!("00");
+                p["subject"].as_array_mut().unwrap().push(other);
+            },
+            |_| {},
+        );
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Encoding)
+        );
+    }
+
+    #[test]
+    fn certificate_revision_extensions_must_agree() {
+        use der::asn1::{OctetString, Utf8StringRef};
+        for number in [10, 19] {
+            let (roots, bundle) = forged(
+                |_| {},
+                |cert| {
+                    let id = crypto::oid(&format!("1.3.6.1.4.1.57264.1.{number}"));
+                    let extension = cert
+                        .tbs_certificate
+                        .extensions
+                        .as_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|e| e.extn_id == id)
+                        .unwrap();
+                    extension.extn_value = OctetString::new(
+                        Utf8StringRef::new("0000000000000000000000000000000000000000")
+                            .unwrap()
+                            .to_der()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                },
+            );
+            assert_eq!(
+                verify(ARTIFACT, &bundle, &roots, &policy()),
+                Err(Error::Identity),
+                "extension {number}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_san_is_rejected_even_when_one_matches() {
+        use der::asn1::Ia5String;
+        use x509_cert::ext::{
+            AsExtension,
+            pkix::{SubjectAltName, name::GeneralName},
+        };
+        let (roots, bundle) = forged(
+            |_| {},
+            |cert| {
+                let id = crypto::oid("2.5.29.17");
+                let mut sans = cert
+                    .tbs_certificate
+                    .get::<SubjectAltName>()
+                    .unwrap()
+                    .unwrap()
+                    .1;
+                sans.0.push(GeneralName::UniformResourceIdentifier(
+                    Ia5String::new("https://github.com/attacker/repo").unwrap(),
+                ));
+                let replacement = sans
+                    .to_extension(&cert.tbs_certificate.subject, &[])
+                    .unwrap();
+                *cert
+                    .tbs_certificate
+                    .extensions
+                    .as_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|e| e.extn_id == id)
+                    .unwrap() = replacement;
+            },
+        );
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Identity)
+        );
+    }
+
+    #[test]
+    fn leaf_key_usage_and_extended_key_usage_profile() {
+        use x509_cert::ext::{
+            AsExtension,
+            pkix::{KeyUsage, KeyUsages},
+        };
+        // digitalSignature plus keyCertSign is not a leaf profile.
+        let (roots, bundle) = forged(
+            |_| {},
+            |cert| {
+                let id = crypto::oid("2.5.29.15");
+                let replacement = KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyCertSign)
+                    .to_extension(&cert.tbs_certificate.subject, &[])
+                    .unwrap();
+                *cert
+                    .tbs_certificate
+                    .extensions
+                    .as_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|e| e.extn_id == id)
+                    .unwrap() = replacement;
+            },
+        );
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Trust)
+        );
+        // A leaf without any extended key usage is not a code-signing certificate.
+        let (roots, bundle) = forged(
+            |_| {},
+            |cert| {
+                let id = crypto::oid("2.5.29.37");
+                cert.tbs_certificate
+                    .extensions
+                    .as_mut()
+                    .unwrap()
+                    .retain(|e| e.extn_id != id);
+            },
+        );
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Trust)
+        );
+    }
+
+    #[test]
+    fn certificate_version_and_unique_ids_are_v3_only() {
+        let (roots, bundle) = forged(
+            |_| {},
+            |cert| cert.tbs_certificate.version = x509_cert::Version::V1,
+        );
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Unsupported)
+        );
+        let (roots, bundle) = forged(
+            |_| {},
+            |cert| {
+                cert.tbs_certificate.issuer_unique_id = Some(BitString::from_bytes(&[1]).unwrap())
+            },
+        );
+        assert_eq!(
+            verify(ARTIFACT, &bundle, &roots, &policy()),
+            Err(Error::Unsupported)
+        );
+    }
 
     #[test]
     fn configurable_identity_constraints_also_apply_to_provenance() {
