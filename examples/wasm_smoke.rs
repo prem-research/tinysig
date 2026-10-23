@@ -1,6 +1,6 @@
 //! A standalone WebAssembly test harness using the real CI fixture.
 //! This adapter exports one test function; it is not part of the library API.
-use trustbase_sigstore::{Error, Policy, TrustedRoot, verify};
+use tinysig::{Error, Policy, TrustedRoot, verify};
 
 /// Return 1 only when the real signature passes and modified artifact bytes fail.
 #[unsafe(no_mangle)]

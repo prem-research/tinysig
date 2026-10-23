@@ -356,6 +356,410 @@ mod tests {
         proof
     }
 
+    fn test_log() -> (Log, ed25519_dalek::SigningKey) {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let log = Log {
+            id: alloc::vec![0; 32],
+            key: super::super::LogKey::Ed25519(signer.verifying_key()),
+            start_ms: 0,
+            end_ms: None,
+        };
+        (log, signer)
+    }
+
+    #[test]
+    fn every_body_field_is_bound_for_each_entry_kind() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let leaf = alloc::vec![0x30u8, 3, 2, 1, 7];
+        let signature = alloc::vec![0x30u8, 2, 2, 0];
+        let other_leaf = alloc::vec![0x30u8, 3, 2, 1, 8];
+        let other_signature = alloc::vec![0x30u8, 2, 2, 1];
+        let digest = [3u8; 32];
+        let pae = [4u8; 32];
+        let pem = |der: &[u8]| {
+            STANDARD.encode(format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                STANDARD.encode(der)
+            ))
+        };
+        let message = Content::Message(digest);
+        let dsse = Content::Dsse {
+            payload: digest,
+            pae,
+        };
+        let declared = |kind: &str, version: &str| KindVersion {
+            kind: kind.into(),
+            version: version.into(),
+        };
+        let check = |body: serde_json::Value, kind: &str, version: &str, content: &Content| {
+            bind(
+                &serde_json::to_vec(&body).unwrap(),
+                &declared(kind, version),
+                &leaf,
+                &signature,
+                content,
+            )
+        };
+        // hashedrekord 0.0.1
+        let v001 = |hash: &str, alg: &str, sig: &[u8], key: &[u8]| {
+            serde_json::json!({"apiVersion": "0.0.1", "kind": "hashedrekord", "spec": {
+                "data": {"hash": {"algorithm": alg, "value": hash}},
+                "signature": {"content": STANDARD.encode(sig), "publicKey": {"content": pem(key)}}}})
+        };
+        let hex = crypto::hex(&digest);
+        check(
+            v001(&hex, "sha256", &signature, &leaf),
+            "hashedrekord",
+            "0.0.1",
+            &message,
+        )
+        .unwrap();
+        for (name, body) in [
+            (
+                "digest",
+                v001(&crypto::hex(&[9; 32]), "sha256", &signature, &leaf),
+            ),
+            ("algorithm", v001(&hex, "sha512", &signature, &leaf)),
+            ("signature", v001(&hex, "sha256", &other_signature, &leaf)),
+            ("certificate", v001(&hex, "sha256", &signature, &other_leaf)),
+        ] {
+            assert_eq!(
+                check(body, "hashedrekord", "0.0.1", &message),
+                Err(Error::Trust),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            check(
+                v001(&hex, "sha256", &signature, &leaf),
+                "hashedrekord",
+                "0.0.1",
+                &dsse
+            ),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(
+            check(
+                v001(&hex, "sha256", &signature, &leaf),
+                "hashedrekord",
+                "0.0.2",
+                &message
+            ),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            check(
+                v001(&hex, "sha256", &signature, &leaf),
+                "dsse",
+                "0.0.1",
+                &message
+            ),
+            Err(Error::Trust)
+        );
+        // dsse 0.0.1
+        let d001 = |hash: &str, alg: &str, sigs: Vec<(&[u8], &[u8])>| {
+            serde_json::json!({"apiVersion": "0.0.1", "kind": "dsse", "spec": {
+                "payloadHash": {"algorithm": alg, "value": hash},
+                "signatures": sigs.iter().map(|(s, k)| serde_json::json!({"signature": STANDARD.encode(s), "verifier": pem(k)})).collect::<Vec<_>>()}})
+        };
+        check(
+            d001(&hex, "sha256", alloc::vec![(&signature[..], &leaf[..])]),
+            "dsse",
+            "0.0.1",
+            &dsse,
+        )
+        .unwrap();
+        for (name, body) in [
+            (
+                "payload",
+                d001(
+                    &crypto::hex(&[9; 32]),
+                    "sha256",
+                    alloc::vec![(&signature[..], &leaf[..])],
+                ),
+            ),
+            (
+                "algorithm",
+                d001(&hex, "sha1", alloc::vec![(&signature[..], &leaf[..])]),
+            ),
+            (
+                "signature",
+                d001(
+                    &hex,
+                    "sha256",
+                    alloc::vec![(&other_signature[..], &leaf[..])],
+                ),
+            ),
+            (
+                "verifier",
+                d001(
+                    &hex,
+                    "sha256",
+                    alloc::vec![(&signature[..], &other_leaf[..])],
+                ),
+            ),
+        ] {
+            assert_eq!(
+                check(body, "dsse", "0.0.1", &dsse),
+                Err(Error::Trust),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            check(
+                d001(
+                    &hex,
+                    "sha256",
+                    alloc::vec![(&signature[..], &leaf[..]), (&signature[..], &leaf[..])]
+                ),
+                "dsse",
+                "0.0.1",
+                &dsse
+            ),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(
+            check(
+                d001(&hex, "sha256", alloc::vec![(&signature[..], &leaf[..])]),
+                "dsse",
+                "0.0.1",
+                &message
+            ),
+            Err(Error::Unsupported)
+        );
+        // hashedrekord 0.0.2
+        let v002 = |d: &[u8], alg: &str, sig: &[u8], details: &str, key: &[u8]| {
+            serde_json::json!({"apiVersion": "0.0.2", "kind": "hashedrekord", "spec": {"hashedRekordV002": {
+                "data": {"algorithm": alg, "digest": STANDARD.encode(d)},
+                "signature": {"content": STANDARD.encode(sig), "verifier": {
+                    "keyDetails": details, "x509Certificate": {"rawBytes": STANDARD.encode(key)}}}}}})
+        };
+        check(
+            v002(
+                &digest,
+                "SHA2_256",
+                &signature,
+                "PKIX_ECDSA_P256_SHA_256",
+                &leaf,
+            ),
+            "hashedrekord",
+            "0.0.2",
+            &message,
+        )
+        .unwrap();
+        check(
+            v002(
+                &pae,
+                "SHA2_256",
+                &signature,
+                "PKIX_ECDSA_P256_SHA_256",
+                &leaf,
+            ),
+            "hashedrekord",
+            "0.0.2",
+            &dsse,
+        )
+        .unwrap();
+        for (name, body, content) in [
+            (
+                "digest",
+                v002(
+                    &[9; 32],
+                    "SHA2_256",
+                    &signature,
+                    "PKIX_ECDSA_P256_SHA_256",
+                    &leaf,
+                ),
+                &message,
+            ),
+            (
+                "payload digest for dsse",
+                v002(
+                    &digest,
+                    "SHA2_256",
+                    &signature,
+                    "PKIX_ECDSA_P256_SHA_256",
+                    &leaf,
+                ),
+                &dsse,
+            ),
+            (
+                "algorithm",
+                v002(
+                    &digest,
+                    "SHA2_384",
+                    &signature,
+                    "PKIX_ECDSA_P256_SHA_256",
+                    &leaf,
+                ),
+                &message,
+            ),
+            (
+                "signature",
+                v002(
+                    &digest,
+                    "SHA2_256",
+                    &other_signature,
+                    "PKIX_ECDSA_P256_SHA_256",
+                    &leaf,
+                ),
+                &message,
+            ),
+            (
+                "key details",
+                v002(&digest, "SHA2_256", &signature, "PKIX_ED25519", &leaf),
+                &message,
+            ),
+            (
+                "certificate",
+                v002(
+                    &digest,
+                    "SHA2_256",
+                    &signature,
+                    "PKIX_ECDSA_P256_SHA_256",
+                    &other_leaf,
+                ),
+                &message,
+            ),
+        ] {
+            assert_eq!(
+                check(body, "hashedrekord", "0.0.2", content),
+                Err(Error::Trust),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            check(
+                v002(
+                    &digest,
+                    "SHA2_256",
+                    &signature,
+                    "PKIX_ECDSA_P256_SHA_256",
+                    &leaf
+                ),
+                "dsse",
+                "0.0.2",
+                &message
+            ),
+            Err(Error::Trust)
+        );
+        let d002 = serde_json::json!({"apiVersion": "0.0.2", "kind": "dsse", "spec": {}});
+        assert_eq!(check(d002, "dsse", "0.0.2", &dsse), Err(Error::Unsupported));
+    }
+
+    #[test]
+    fn checkpoint_text_and_signature_lines_are_validated() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use ed25519_dalek::Signer;
+        let (log, signer) = test_log();
+        let root = [5u8; 32];
+        let text = format!("origin\n7\n{}\n", STANDARD.encode(root));
+        let line = |text: &str, hint: &[u8], signer: &ed25519_dalek::SigningKey| {
+            let mut signature = hint.to_vec();
+            signature.extend_from_slice(&signer.sign(text.as_bytes()).to_bytes());
+            format!("\u{2014} origin {}\n", STANDARD.encode(signature))
+        };
+        let good = line(&text, &[0; 4], &signer);
+        checkpoint(&format!("{text}\n{good}"), 7, &root, &log).unwrap();
+        // Witness lines before and after are ignored; the log signature is still required.
+        let witness = line(
+            &text,
+            &[1, 2, 3, 4],
+            &ed25519_dalek::SigningKey::from_bytes(&[2; 32]),
+        );
+        checkpoint(&format!("{text}\n{witness}{good}{witness}"), 7, &root, &log).unwrap();
+        assert_eq!(
+            checkpoint(&format!("{text}\n{witness}"), 7, &root, &log),
+            Err(Error::Signature)
+        );
+        // Wrong key hint with a valid signature.
+        let hinted = line(&text, &[9, 9, 9, 9], &signer);
+        assert_eq!(
+            checkpoint(&format!("{text}\n{hinted}"), 7, &root, &log),
+            Err(Error::Signature)
+        );
+        // Size and root must match the proof, and the origin must be present.
+        assert_eq!(
+            checkpoint(&format!("{text}\n{good}"), 8, &root, &log),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            checkpoint(&format!("{text}\n{good}"), 7, &[6; 32], &log),
+            Err(Error::Trust)
+        );
+        let empty_origin = format!("\n7\n{}\n", STANDARD.encode(root));
+        let signed = line(&empty_origin, &[0; 4], &signer);
+        assert_eq!(
+            checkpoint(&format!("{empty_origin}\n{signed}"), 7, &root, &log),
+            Err(Error::Trust)
+        );
+        // Signature-line count limits and malformed lines.
+        assert_eq!(
+            checkpoint(&format!("{text}\n"), 7, &root, &log),
+            Err(Error::Limit)
+        );
+        let many: String = (0..17).map(|_| good.clone()).collect();
+        assert_eq!(
+            checkpoint(&format!("{text}\n{many}"), 7, &root, &log),
+            Err(Error::Limit)
+        );
+        let sixteen: String = (0..16).map(|_| good.clone()).collect();
+        checkpoint(&format!("{text}\n{sixteen}"), 7, &root, &log).unwrap();
+        assert_eq!(
+            checkpoint(&format!("{text}\nnot a signature line\n"), 7, &root, &log),
+            Err(Error::Encoding)
+        );
+        assert_eq!(
+            checkpoint(&format!("{text}\n\u{2014} origin AAAA\n"), 7, &root, &log),
+            Err(Error::Signature)
+        );
+        assert_eq!(
+            checkpoint("no blank line", 7, &root, &log),
+            Err(Error::Encoding)
+        );
+        assert_eq!(
+            checkpoint(&format!("origin\n7\n\n{good}"), 7, &root, &log),
+            Err(Error::Encoding)
+        );
+        let huge = format!("{text}{}\n{good}", "x".repeat(64 * 1024));
+        assert_eq!(checkpoint(&huge, 7, &root, &log), Err(Error::Limit));
+    }
+
+    #[test]
+    fn inclusion_proof_limits() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let (log, _) = test_log();
+        let proof = |n: usize, index: &str, size: &str| Proof {
+            log_index: index.into(),
+            root_hash: STANDARD.encode([0u8; 32]),
+            tree_size: size.into(),
+            hashes: alloc::vec![STANDARD.encode([0u8; 32]); n],
+            checkpoint: Checkpoint {
+                envelope: String::new(),
+            },
+        };
+        assert_eq!(
+            inclusion(&proof(65, "0", "2"), b"x", &log),
+            Err(Error::Limit)
+        );
+        assert_eq!(
+            inclusion(&proof(64, "0", "2"), b"x", &log),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            inclusion(&proof(2, "2", "2"), b"x", &log),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            inclusion(&proof(1, "0", "1"), b"x", &log),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            inclusion(&proof(0, "0", "2"), b"x", &log),
+            Err(Error::Trust)
+        );
+    }
+
     #[test]
     fn inclusion_proofs_for_every_leaf_of_small_trees() {
         use base64::{Engine, engine::general_purpose::STANDARD};

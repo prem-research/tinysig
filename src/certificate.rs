@@ -586,6 +586,127 @@ mod tests {
     }
 
     #[test]
+    fn each_ca_certificate_requirement_is_enforced() {
+        let time = 1_792_538_002;
+        let (_, key) = test_roots();
+        let leaf = leaf(&key);
+        let with = |edit: &dyn Fn(&mut Certificate)| {
+            let (mut roots, key) = test_roots();
+            let authority = roots.fulcio.last_mut().unwrap();
+            let intermediate = authority.chain.first_mut().unwrap();
+            edit(intermediate);
+            test_sign(intermediate, &key);
+            authority.verify(&leaf, time, CODE_SIGNING)
+        };
+        with(&|_| {}).unwrap();
+        let replace = |cert: &mut Certificate, id: &str, extension: Extension| {
+            *cert
+                .tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|e| e.extn_id == oid(id))
+                .unwrap() = extension;
+        };
+        let subject = leaf.tbs_certificate.subject.clone();
+        let constraints = |ca| BasicConstraints {
+            ca,
+            path_len_constraint: None,
+        };
+        // Non-critical basicConstraints.
+        assert_eq!(
+            with(&|c| {
+                let mut extension = constraints(true).to_extension(&subject, &[]).unwrap();
+                extension.critical = false;
+                replace(c, "2.5.29.19", extension);
+            }),
+            Err(Error::Trust)
+        );
+        // cA=FALSE.
+        assert_eq!(
+            with(&|c| replace(
+                c,
+                "2.5.29.19",
+                constraints(false).to_extension(&subject, &[]).unwrap()
+            )),
+            Err(Error::Trust)
+        );
+        // No basicConstraints at all.
+        assert_eq!(
+            with(&|c| c
+                .tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .retain(|e| e.extn_id != oid("2.5.29.19"))),
+            Err(Error::Trust)
+        );
+        // keyUsage without keyCertSign, and no keyUsage.
+        assert_eq!(
+            with(&|c| replace(
+                c,
+                "2.5.29.15",
+                KeyUsage(x509_cert::ext::pkix::KeyUsages::DigitalSignature.into())
+                    .to_extension(&subject, &[])
+                    .unwrap()
+            )),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            with(&|c| c
+                .tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .retain(|e| e.extn_id != oid("2.5.29.15"))),
+            Err(Error::Trust)
+        );
+        // An EKU that omits code signing.
+        assert_eq!(
+            with(&|c| replace(
+                c,
+                "2.5.29.37",
+                ExtendedKeyUsage(alloc::vec![TIMESTAMPING])
+                    .to_extension(&subject, &[])
+                    .unwrap()
+            )),
+            Err(Error::Trust)
+        );
+    }
+
+    #[test]
+    fn certificate_size_limit_and_fractional_metadata_seconds() {
+        let (_, key) = test_roots();
+        let mut cert = leaf(&key);
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(Extension {
+                extn_id: oid("1.2.3.4.5"),
+                critical: false,
+                extn_value: OctetString::new(alloc::vec![0; 16 * 1024]).unwrap(),
+            });
+        assert_eq!(parse(&cert.to_der().unwrap()), Err(Error::Limit));
+        assert_eq!(
+            parse_rfc3339("2022-10-20T00:00:00.5Z"),
+            Ok((1_666_224_000, 500_000_000))
+        );
+        assert_eq!(
+            parse_rfc3339("2022-10-20T00:00:00.123456789Z"),
+            Ok((1_666_224_000, 123_456_789))
+        );
+        assert_eq!(
+            parse_rfc3339("2022-10-20T00:00:01.000000001Z"),
+            Ok((1_666_224_001, 1))
+        );
+        assert_eq!(parse_rfc3339("1969-12-31T23:59:59Z"), Err(Error::Encoding));
+        assert_eq!(parse_rfc3339("2022-13-20T00:00:00Z"), Err(Error::Encoding));
+        assert_eq!(parse_time("2022-10-20T00:00:00.5Z"), Err(Error::Encoding));
+    }
+
+    #[test]
     fn certificate_extensions_fail_closed() {
         let (_, key) = test_roots();
         let mut cert = leaf(&key);

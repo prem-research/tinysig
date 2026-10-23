@@ -454,7 +454,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "trustbase-sigstore"
+name = "tinysig"
 version = "0.1.0"
 dependencies = [
  "base64",

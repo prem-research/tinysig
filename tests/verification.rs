@@ -1,7 +1,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use trustbase_sigstore::{Error, Policy, PolicyBuilder, TrustedRoot, verify, verify_digest};
+use tinysig::{Error, Policy, PolicyBuilder, TrustedRoot, verify, verify_digest};
 
 const ARTIFACT: &[u8] = include_bytes!("fixtures/measurements.json");
 const BUNDLE: &[u8] = include_bytes!("fixtures/provenance.sigstore.json");
@@ -231,4 +231,62 @@ fn malformed_and_oversized_inputs_do_not_verify() {
         TrustedRoot::from_json(&serde_json::to_vec(&root).unwrap()),
         Err(Error::Unsupported)
     ));
+}
+
+#[test]
+fn trust_metadata_count_limits_are_exact() {
+    let root: Value = serde_json::from_slice(ROOT).unwrap();
+    let with = |change: &dyn Fn(&mut Value)| {
+        let mut root = root.clone();
+        change(&mut root);
+        TrustedRoot::from_json(&serde_json::to_vec(&root).unwrap()).map(|_| ())
+    };
+    for key in ["certificateAuthorities", "timestampAuthorities"] {
+        assert_eq!(
+            with(&|r| r[key] = json!([])),
+            Err(Error::Limit),
+            "{key} empty"
+        );
+        let authority = root[key][0].clone();
+        assert!(with(&|r| r[key] = Value::Array(vec![authority.clone(); 16])).is_ok());
+        assert_eq!(
+            with(&|r| r[key] = Value::Array(vec![authority.clone(); 17])),
+            Err(Error::Limit),
+            "{key} 17"
+        );
+        // Chains must carry two to four certificates.
+        let certificates = authority["certChain"]["certificates"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let chain = |n: usize| {
+            let mut a = authority.clone();
+            a["certChain"]["certificates"] =
+                Value::Array(certificates.iter().cycle().take(n).cloned().collect());
+            a
+        };
+        assert_eq!(
+            with(&|r| r[key] = json!([chain(1)])),
+            Err(Error::Unsupported),
+            "{key} chain of 1"
+        );
+        assert!(
+            with(&|r| r[key] = json!([chain(2)])).is_ok(),
+            "{key} chain of 2"
+        );
+        assert!(
+            with(&|r| r[key] = json!([chain(4)])).is_ok(),
+            "{key} chain of 4"
+        );
+        assert_eq!(
+            with(&|r| r[key] = json!([chain(5)])),
+            Err(Error::Unsupported),
+            "{key} chain of 5"
+        );
+        assert_eq!(
+            with(&|r| r[key][0]["uri"] = json!("fulcio.example")),
+            Err(Error::Unsupported),
+            "{key} uri"
+        );
+    }
 }

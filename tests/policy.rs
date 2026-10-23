@@ -1,4 +1,4 @@
-use trustbase_sigstore::{
+use tinysig::{
     EMBEDDED_GITHUB_TRUST_ROOT, Error, Policy, PolicyBuilder, RunnerEnvironment, TrustedRoot,
     verify,
 };
@@ -239,4 +239,104 @@ fn existing_policy_can_be_rebuilt_without_losing_constraints() {
             .build()
             .unwrap()
     );
+}
+
+#[test]
+fn policy_length_limits_are_exact() {
+    let owner = "o".repeat(100);
+    assert!(
+        builder()
+            .repository(format!("{owner}/{}", "r".repeat(99)))
+            .build()
+            .is_ok()
+    );
+    assert!(matches!(
+        builder()
+            .repository(format!("{owner}/{}", "r".repeat(100)))
+            .build(),
+        Err(Error::Policy)
+    ));
+    assert!(matches!(
+        builder().repository("a/.").build(),
+        Err(Error::Policy)
+    ));
+    assert!(matches!(
+        builder().repository("./a").build(),
+        Err(Error::Policy)
+    ));
+    assert!(matches!(
+        builder().repository("a/b c").build(),
+        Err(Error::Policy)
+    ));
+    let path = |n: usize| format!(".github/workflows/{}.yml", "w".repeat(n));
+    assert!(builder().workflow_path(path(255 - 22)).build().is_ok());
+    assert!(matches!(
+        builder().workflow_path(path(256 - 22)).build(),
+        Err(Error::Policy)
+    ));
+    assert!(matches!(
+        builder().workflow_path(".github/workflows/a b.yml").build(),
+        Err(Error::Policy)
+    ));
+    assert!(builder().artifact_name("a".repeat(255)).build().is_ok());
+    assert!(matches!(
+        builder().artifact_name("a".repeat(256)).build(),
+        Err(Error::Policy)
+    ));
+    assert!(builder().event_name("e".repeat(64)).build().is_ok());
+    assert!(matches!(
+        builder().event_name("e".repeat(65)).build(),
+        Err(Error::Policy)
+    ));
+    assert!(builder().repository_id("1".repeat(20)).build().is_ok());
+    assert!(matches!(
+        builder().repository_id("1".repeat(21)).build(),
+        Err(Error::Policy)
+    ));
+    assert!(matches!(
+        builder().repository_owner_id("1".repeat(21)).build(),
+        Err(Error::Policy)
+    ));
+    // `builder()` already allows one tag; 31 more is the 32-ref maximum.
+    let mut policy = builder();
+    for i in 0..31 {
+        policy = policy.allow_git_ref(format!("refs/tags/v{i}"));
+    }
+    assert_eq!(policy.build().unwrap().allowed_git_refs().len(), 32);
+    assert!(
+        builder()
+            .git_ref(format!("refs/tags/{}", "t".repeat(502)))
+            .build()
+            .is_ok()
+    );
+    assert!(matches!(
+        builder()
+            .git_ref(format!("refs/tags/{}", "t".repeat(503)))
+            .build(),
+        Err(Error::Policy)
+    ));
+    for issuer in [
+        "https://example.com/a?b",
+        "https://example.com/a#b",
+        "https://example.com/a\\b",
+        "https://example.com/a b",
+        "https://exa mple.com",
+    ] {
+        assert!(
+            matches!(builder().oidc_issuer(issuer).build(), Err(Error::Policy)),
+            "{issuer}"
+        );
+    }
+    assert!(
+        builder()
+            .oidc_issuer(format!("https://e.com/{}", "p".repeat(2048 - 14)))
+            .build()
+            .is_ok()
+    );
+    assert!(matches!(
+        builder()
+            .oidc_issuer(format!("https://e.com/{}", "p".repeat(2049 - 14)))
+            .build(),
+        Err(Error::Policy)
+    ));
 }
