@@ -6,15 +6,15 @@ metadata you provide. There is no network access, platform clock, randomness,
 TLS, or filesystem use.
 
 - `no_std` + `alloc`; builds for `wasm32-unknown-unknown` with zero host imports.
-- Nine direct dependencies, all pure-Rust RustCrypto/serde crates.
+- Pure-Rust dependencies, including RustCrypto, serde, and semver.
 - Fail-closed: unsupported formats and algorithms are rejected, never skipped,
   and errors return no partially verified data.
 
-The package is currently published as `trustbase-sigstore`:
+Use the local package:
 
 ```toml
 [dependencies]
-trustbase-sigstore = { path = "../tinysig" }
+tinysig = { path = "../tinysig" }
 ```
 
 ## Two verifiers
@@ -25,7 +25,7 @@ trustbase-sigstore = { path = "../tinysig" }
 | Instance | GitHub's private Sigstore (`fulcio.githubapp.com`) | `fulcio.sigstore.dev`, Rekor, CT |
 | Evidence | Fulcio certificate + RFC 3161 timestamp | Fulcio certificate + SCT + Rekor v1/v2 entries (+ RFC 3161) |
 | Content | DSSE in-toto statement with SLSA v1 provenance | Message signature or DSSE in-toto statement |
-| Policy | Repository, workflow, refs, trigger, runner, commit, subject name | Exact certificate identity and OIDC issuer |
+| Policy | Shared `Identity`, trigger, runner, commit, subject name | Shared `Identity` (exact SAN or workflow with refs/semver tags, exact issuer) |
 | Trust root | Embedded GitHub snapshot, or your own | Yours (no embedded snapshot) |
 | Returns | Signing time, source commit, matched ref | Signing times, SHA-256, signed DSSE payload |
 
@@ -40,7 +40,7 @@ caller. Supply it from a trusted clock or release policy, never from the bundle.
 ## GitHub artifact attestations
 
 ```rust,no_run
-use trustbase_sigstore::{Policy, TrustedRoot, verify};
+use tinysig::{Policy, TrustedRoot, verify};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let roots = TrustedRoot::embedded()?;
 let policy = Policy::builder()
@@ -76,12 +76,53 @@ defaults. The repository and workflow defaults are Trustbase's (see
 inverted time bounds. The finished policy owns its strings and can be reused
 across calls; `policy.to_builder()` changes one constraint and keeps the rest.
 
+Both verifiers use `Identity`, built with `Identity::builder()` (or
+`IdentityBuilder::default()`). It pins an exact OIDC issuer and either an exact
+URI/email SAN via `subject(...)`, or a GitHub repository/workflow with allowed
+refs. Unlike `Policy::builder()`, `Identity::builder()` has no default repository.
+The workflow defaults to `.github/workflows/release.yml` and the issuer to
+`https://token.actions.githubusercontent.com`. Exact subjects cannot be mixed
+with structured workflow/ref constraints.
+
+To accept compatible releases without changing the identity for every tag:
+
+```rust,no_run
+use tinysig::{Identity, Policy};
+# fn example() -> Result<(), tinysig::Error> {
+let identity = Identity::builder()
+    .repository("example/project")
+    .workflow_path(".github/workflows/release.yml")
+    .semver_range(">=1.2.0, <2.0.0")
+    .tag_prefix("v")
+    .build()?;
+let policy = Policy::builder()
+    .identity(identity)
+    .artifact_name("package.tar.gz")
+    .not_after(1_792_627_200)
+    .build()?;
+# let _ = policy;
+# Ok(())
+# }
+```
+
+`semver_range` uses Cargo-style requirements (`^1.2`, `~1.2`, `>=1.2.0, <2.0.0`).
+Only `refs/tags/` refs qualify, with a literal prefix of `v` by default; use
+`tag_prefix("")` for bare versions or `tag_prefix("releases/v")` for nested tags.
+Versions must be complete semver (`1.2.3`, not `1.2`). Prereleases are excluded
+unless a comparator explicitly permits the same major/minor/patch prerelease;
+build metadata does not affect range matching. Repository, workflow, and issuer
+are always exact matches. A range authorizes every matching tag; it does not
+select the latest version or prevent rollback within the range.
+`PolicyBuilder` also exposes `semver_range` and
+`tag_prefix` as shortcuts. The GitHub attestation profile requires a structured
+workflow identity; exact URI/email identities are supported by `PublicVerifier`.
+
 Pin an immutable source commit, repository/owner IDs, runner classification,
 trigger, and an inclusive signing-time interval when you know them:
 
 ```rust,no_run
-use trustbase_sigstore::{Policy, RunnerEnvironment};
-# fn example() -> Result<(), trustbase_sigstore::Error> {
+use tinysig::{Policy, RunnerEnvironment};
+# fn example() -> Result<(), tinysig::Error> {
 let policy = Policy::builder()
     .repository("example/project")
     .workflow_path(".github/workflows/build.yaml")
@@ -103,8 +144,8 @@ let policy = Policy::builder()
 Permit an explicit set of refs, for example during a release transition:
 
 ```rust,no_run
-# use trustbase_sigstore::Policy;
-# fn example() -> Result<(), trustbase_sigstore::Error> {
+# use tinysig::Policy;
+# fn example() -> Result<(), tinysig::Error> {
 let policy = Policy::builder()
     .repository("example/project")
     .git_ref("refs/tags/v1.2.0")
@@ -117,8 +158,8 @@ let policy = Policy::builder()
 # }
 ```
 
-`git_ref`, `release_tag`, and `branch` replace the allowed-ref set;
-`allow_git_ref` appends to it. Ref matching is exact, duplicates are removed,
+`git_ref`, `release_tag`, `branch`, and `semver_range` replace all ref constraints;
+`allow_git_ref` adds an exact alternative to the refs/range. Duplicates are removed,
 and at most 32 refs may be supplied. Tags need no `v` prefix and may contain
 slashes. Refs use a conservative ASCII Git-ref subset: no wildcard, whitespace,
 empty/dot-prefixed components, `..`, trailing `.`, or `.lock` suffix. Repository
@@ -128,7 +169,8 @@ identity matching is case-sensitive.
 `oidc_issuer` sets an exact issuer expectation without changing the trusted CAs.
 `source_revision` pins a 40-character lowercase commit. Runner, repository ID,
 and owner ID constraints are checked in both the certificate and the signed
-provenance. `VerifiedArtifact::source_ref` reports which allowed ref matched.
+provenance. `VerifiedArtifact::source_ref` reports the exact authenticated ref,
+including when a semver range authorized it.
 There are no switches that skip signature, digest, identity, or timestamp checks.
 
 The same repository, ref, and workflow must appear in the certificate SAN, build
@@ -154,7 +196,7 @@ refresh procedure.
 After an authority rotation, update the crate or supply authenticated metadata:
 
 ```rust,no_run
-use trustbase_sigstore::TrustedRoot;
+use tinysig::TrustedRoot;
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
 let roots = TrustedRoot::from_json(&std::fs::read("github-trusted-root.json")?)?;
 # let _ = roots;
@@ -223,13 +265,17 @@ Rekor evidence, so this path makes no public transparency claim.
 
 ```rust,no_run
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
-use trustbase_sigstore::public::PublicVerifier;
+use tinysig::{Identity, public::PublicVerifier};
 let verifier = PublicVerifier::from_json(&std::fs::read("public-trusted-root.json")?)?;
+let identity = Identity::builder()
+    .repository("owner/repo")
+    .workflow_path(".github/workflows/release.yml")
+    .semver_range("^1.0")
+    .build()?;
 let result = verifier.verify(
     &std::fs::read("artifact.txt")?,
     &std::fs::read("artifact.sigstore.json")?,
-    "https://github.com/owner/repo/.github/workflows/release.yml@refs/tags/v1.0.0",
-    "https://token.actions.githubusercontent.com",
+    &identity,
     1_792_627_200, // Example: supply a trusted current-time upper bound.
 )?;
 println!("Verified SHA-256: {:02x?}", result.sha256);
@@ -245,9 +291,10 @@ accepts a caller-computed SHA-256. A successful result means:
    has one P-256 signature over the PAE of an in-toto v1/v0.1 statement whose
    subjects include the artifact's SHA-256; `dsse_payload` returns the signed
    statement bytes.
-2. **Identity.** The Fulcio leaf has exactly one SAN, a URI or email equal to
-   `identity`, and its issuer extension (`1.3.6.1.4.1.57264.1.8`, or legacy
-   `.1.1`; both must agree when present) equals `issuer`.
+2. **Identity.** The Fulcio leaf has exactly one SAN, a URI or email accepted by
+   `Identity` (exact subject, or pinned workflow with an authorized ref/version),
+   and its issuer extension (`1.3.6.1.4.1.57264.1.8`, or legacy `.1.1`; both must
+   agree when present) equals `Identity::oidc_issuer()`.
 3. **Transparency.** Every Rekor entry (1–16) is checked against the log named
    by its `logId` only. Its canonicalized body must name this exact signature,
    certificate, and artifact/payload digest, and it must have an RFC 9162
@@ -294,7 +341,7 @@ claim about that digest.
 ```rust,no_run
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use trustbase_sigstore::{Policy, TrustedRoot, verify_digest};
+use tinysig::{Policy, TrustedRoot, verify_digest};
 # fn example(mut archive: impl Read, bundle: &[u8], roots: &TrustedRoot, policy: &Policy) -> Result<(), Box<dyn std::error::Error>> {
 let mut hash = Sha256::new();
 let mut buffer = [0u8; 64 * 1024];
@@ -405,7 +452,7 @@ defaults (repository `prem-research/trustbase`, workflow
 Trustbase consumer only names the release and artifact:
 
 ```rust,no_run
-use trustbase_sigstore::{Policy, TrustedRoot, verify};
+use tinysig::{Policy, TrustedRoot, verify};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let policy = Policy::builder()
     .release_tag("v1.0.0")
