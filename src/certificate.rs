@@ -347,15 +347,18 @@ pub(crate) fn extension_string(cert: &Certificate, number: u8) -> Result<String>
         .into())
 }
 
-pub(crate) struct Identity {
+pub(crate) struct VerifiedWorkflowIdentity {
     pub source_revision: String,
     pub git_ref: String,
     pub workflow: String,
 }
 
-pub(crate) fn identity(cert: &Certificate, policy: &crate::Policy) -> Result<Identity> {
+pub(crate) fn identity(
+    cert: &Certificate,
+    policy: &crate::Policy,
+) -> Result<VerifiedWorkflowIdentity> {
     let git_ref = extension_string(cert, 14)?;
-    if !policy.git_refs.contains(&git_ref) {
+    if !policy.identity.allows_git_ref(&git_ref) {
         return Err(Error::Identity);
     }
     let workflow = policy.workflow_identity(&git_ref);
@@ -373,9 +376,9 @@ pub(crate) fn identity(cert: &Certificate, policy: &crate::Policy) -> Result<Ide
         return Err(Error::Identity);
     }
     for (number, expected) in [
-        (8, policy.oidc_issuer.as_str()),
+        (8, policy.oidc_issuer()),
         (9, workflow.as_str()),
-        (12, policy.repository.as_str()),
+        (12, policy.repository()),
         (18, workflow.as_str()),
         (20, policy.event_name.as_str()),
     ] {
@@ -405,7 +408,7 @@ pub(crate) fn identity(cert: &Certificate, policy: &crate::Policy) -> Result<Ide
     {
         return Err(Error::Identity);
     }
-    Ok(Identity {
+    Ok(VerifiedWorkflowIdentity {
         source_revision: revision,
         git_ref,
         workflow,
@@ -459,6 +462,43 @@ mod tests {
                 .unwrap();
         test_sign(&mut leaf, key);
         leaf
+    }
+
+    #[test]
+    fn a_semver_range_still_requires_the_san_to_bind_the_exact_source_ref() {
+        let bundle: crate::Bundle =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/provenance.sigstore.json"))
+                .unwrap();
+        let mut cert =
+            parse(&crypto::b64(&bundle.verification_material.certificate.raw_bytes).unwrap())
+                .unwrap();
+        let policy = crate::Policy::builder()
+            .semver_range("^1.0")
+            .artifact_name("measurements.json")
+            .not_after(1_792_627_200)
+            .build()
+            .unwrap();
+        assert_eq!(
+            identity(&cert, &policy).unwrap().git_ref,
+            "refs/tags/v1.0.0"
+        );
+        // Both tags satisfy the range, but only one is bound by the SAN.
+        let id = oid("1.3.6.1.4.1.57264.1.14");
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|e| e.extn_id == id)
+            .unwrap()
+            .extn_value = OctetString::new(
+            der::asn1::Utf8StringRef::new("refs/tags/v1.1.0")
+                .unwrap()
+                .to_der()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(identity(&cert, &policy).err(), Some(Error::Identity));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use tinysig::{
-    EMBEDDED_GITHUB_TRUST_ROOT, Error, Policy, PolicyBuilder, RunnerEnvironment, TrustedRoot,
-    verify,
+    EMBEDDED_GITHUB_TRUST_ROOT, Error, Identity, Policy, PolicyBuilder, RunnerEnvironment,
+    TrustedRoot, verify,
 };
 
 const ARTIFACT: &[u8] = include_bytes!("fixtures/measurements.json");
@@ -339,4 +339,65 @@ fn policy_length_limits_are_exact() {
             .build(),
         Err(Error::Policy)
     ));
+}
+
+#[test]
+fn shared_identity_authorizes_semver_tags_without_weakening_provenance() {
+    let roots = TrustedRoot::embedded().unwrap();
+    let identity = Identity::builder()
+        .repository("prem-research/trustbase")
+        .semver_range(">=1.0.0, <2.0.0")
+        .build()
+        .unwrap();
+    let policy = builder().identity(identity.clone()).build().unwrap();
+    assert_eq!(policy.identity(), &identity);
+    assert_eq!(policy, policy.to_builder().build().unwrap());
+    assert_eq!(
+        verify(ARTIFACT, BUNDLE, &roots, &policy)
+            .unwrap()
+            .source_ref,
+        "refs/tags/v1.0.0"
+    );
+    for identity in [
+        identity.to_builder().semver_range("^1.1").build().unwrap(),
+        identity
+            .to_builder()
+            .repository("evil/project")
+            .build()
+            .unwrap(),
+        identity
+            .to_builder()
+            .workflow_path(".github/workflows/other.yml")
+            .build()
+            .unwrap(),
+        identity
+            .to_builder()
+            .oidc_issuer("https://evil.example")
+            .build()
+            .unwrap(),
+        identity.to_builder().tag_prefix("").build().unwrap(),
+    ] {
+        let policy = builder().identity(identity).build().unwrap();
+        assert_eq!(
+            verify(ARTIFACT, BUNDLE, &roots, &policy),
+            Err(Error::Identity)
+        );
+    }
+    let policy = builder().semver_range("^1.0").build().unwrap();
+    verify(ARTIFACT, BUNDLE, &roots, &policy).unwrap();
+    assert!(
+        policy
+            .to_builder()
+            .release_tag("v1.1.0")
+            .build()
+            .unwrap()
+            .identity()
+            .semver_range()
+            .is_none()
+    );
+    let exact = Identity::builder()
+        .subject("signer@example.com")
+        .build()
+        .unwrap();
+    assert_eq!(builder().identity(exact).build(), Err(Error::Policy));
 }

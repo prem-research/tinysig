@@ -1,7 +1,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tinysig::{Error, public::PublicVerifier};
+use tinysig::{Error, Identity, public::PublicVerifier};
 
 const ARTIFACT: &[u8] = include_bytes!("fixtures/upstream/a.txt");
 const IDENTITY: &str = "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main";
@@ -15,6 +15,14 @@ const V2_DSSE: &[u8] = include_bytes!("fixtures/upstream/staging-rekor2-dsse-v03
 const V2_MESSAGE_ROOT: &[u8] = include_bytes!("fixtures/upstream/staging-rekor2-message-root.json");
 const V2_MESSAGE: &[u8] = include_bytes!("fixtures/upstream/staging-rekor2-message-v03.json");
 
+fn identity(subject: &str, issuer: &str) -> Identity {
+    Identity::builder()
+        .subject(subject)
+        .oidc_issuer(issuer)
+        .build()
+        .unwrap()
+}
+
 const CASES: [(&[u8], &[u8], u64); 4] = [
     (PUBLIC_ROOT, V1_DSSE, 1_734_374_576),
     (PUBLIC_ROOT, V1_MESSAGE, 1_710_869_186),
@@ -24,7 +32,7 @@ const CASES: [(&[u8], &[u8], u64); 4] = [
 
 fn verify(root: &[u8], bundle: &[u8]) -> Result<Vec<u64>, Error> {
     PublicVerifier::from_json(root)?
-        .verify(ARTIFACT, bundle, IDENTITY, ISSUER, NOT_AFTER)
+        .verify(ARTIFACT, bundle, &identity(IDENTITY, ISSUER), NOT_AFTER)
         .map(|result| result.signed_at_unix_seconds)
 }
 
@@ -39,7 +47,7 @@ fn upstream_current_bundles_verify() {
     for (root, bundle, time) in CASES {
         let verifier = PublicVerifier::from_json(root).unwrap();
         let result = verifier
-            .verify(ARTIFACT, bundle, IDENTITY, ISSUER, NOT_AFTER)
+            .verify(ARTIFACT, bundle, &identity(IDENTITY, ISSUER), NOT_AFTER)
             .unwrap();
         assert_eq!(result.signed_at_unix_seconds, [time]);
         assert_eq!(result.sha256, <[u8; 32]>::from(Sha256::digest(ARTIFACT)));
@@ -48,18 +56,23 @@ fn upstream_current_bundles_verify() {
             .map(|payload| STANDARD.decode(payload).unwrap());
         assert_eq!(result.dsse_payload, dsse);
         assert_eq!(
-            verifier.verify_digest(result.sha256, bundle, IDENTITY, ISSUER, NOT_AFTER),
+            verifier.verify_digest(
+                result.sha256,
+                bundle,
+                &identity(IDENTITY, ISSUER),
+                NOT_AFTER
+            ),
             Ok(result)
         );
         // The time bound is inclusive.
         verifier
-            .verify(ARTIFACT, bundle, IDENTITY, ISSUER, time)
+            .verify(ARTIFACT, bundle, &identity(IDENTITY, ISSUER), time)
             .unwrap();
-        for (artifact, identity, issuer, not_after, error) in [
+        for (artifact, subject, issuer, not_after, error) in [
             (&b"tampered"[..], IDENTITY, ISSUER, NOT_AFTER, None),
             (
                 ARTIFACT,
-                "wrong identity",
+                "https://example.com/wrong-identity",
                 ISSUER,
                 NOT_AFTER,
                 Some(Error::Identity),
@@ -67,20 +80,43 @@ fn upstream_current_bundles_verify() {
             (
                 ARTIFACT,
                 IDENTITY,
-                "wrong issuer",
+                "https://example.com/wrong-issuer",
                 NOT_AFTER,
                 Some(Error::Identity),
             ),
             (ARTIFACT, IDENTITY, ISSUER, time - 1, Some(Error::Timestamp)),
-            (ARTIFACT, "", ISSUER, NOT_AFTER, Some(Error::Policy)),
-            (ARTIFACT, IDENTITY, "", NOT_AFTER, Some(Error::Policy)),
         ] {
-            let result = verifier.verify(artifact, bundle, identity, issuer, not_after);
+            let result = verifier.verify(artifact, bundle, &identity(subject, issuer), not_after);
             assert!(result.is_err());
             if let Some(error) = error {
                 assert_eq!(result, Err(error));
             }
         }
+    }
+}
+
+#[test]
+fn structured_identity_is_shared_by_public_verification_and_rejects_branches_for_ranges() {
+    let identity = Identity::builder()
+        .repository("sigstore-conformance/extremely-dangerous-public-oidc-beacon")
+        .workflow_path(".github/workflows/extremely-dangerous-oidc-beacon.yml")
+        .branch("main")
+        .build()
+        .unwrap();
+    for (root, bundle, _) in CASES {
+        let verifier = PublicVerifier::from_json(root).unwrap();
+        let result = verifier
+            .verify(ARTIFACT, bundle, &identity, NOT_AFTER)
+            .unwrap();
+        assert_eq!(
+            verifier.verify_digest(result.sha256, bundle, &identity, NOT_AFTER),
+            Ok(result)
+        );
+        let range = identity.to_builder().semver_range("*").build().unwrap();
+        assert_eq!(
+            verifier.verify(ARTIFACT, bundle, &range, NOT_AFTER),
+            Err(Error::Identity)
+        );
     }
 }
 
@@ -251,7 +287,7 @@ fn bundle_shapes_and_bindings() {
     // A DSSE statement must name the artifact digest as a subject.
     let verifier = PublicVerifier::from_json(PUBLIC_ROOT).unwrap();
     assert_eq!(
-        verifier.verify_digest([0; 32], V1_DSSE, IDENTITY, ISSUER, NOT_AFTER),
+        verifier.verify_digest([0; 32], V1_DSSE, &identity(IDENTITY, ISSUER), NOT_AFTER),
         Err(Error::Artifact)
     );
     // Swapping the transparency entries of two valid bundles fails the binding.

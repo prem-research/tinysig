@@ -8,6 +8,7 @@ extern crate alloc;
 mod certificate;
 mod crypto;
 mod error;
+mod identity;
 mod policy;
 pub mod public;
 mod timestamp;
@@ -16,6 +17,7 @@ use alloc::{format, string::String, vec::Vec};
 pub use certificate::{EMBEDDED_GITHUB_TRUST_ROOT, TrustedRoot};
 pub use error::Error;
 use error::Result;
+pub use identity::{Identity, IdentityBuilder};
 pub use policy::{Policy, PolicyBuilder, RunnerEnvironment};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -29,7 +31,7 @@ pub struct VerifiedArtifact {
     pub signed_at_unix_seconds: u64,
     /// Source commit bound by the certificate and signed provenance.
     pub source_revision: String,
-    /// Exact source ref selected from the policy allowlist.
+    /// Exact source ref authorized by the identity's allowlist or semver range.
     pub source_ref: String,
 }
 
@@ -163,15 +165,15 @@ fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
 
 fn verify_provenance(
     predicate: &Provenance,
-    identity: &certificate::Identity,
+    identity: &certificate::VerifiedWorkflowIdentity,
     policy: &Policy,
 ) -> Result<()> {
     let definition = &predicate.build_definition;
     let source = &definition.external_parameters.workflow;
     let github = &definition.internal_parameters.github;
     if definition.build_type != "https://actions.github.io/buildtypes/workflow/v1"
-        || source.repository != policy.repository
-        || source.path != policy.workflow_path
+        || source.repository != policy.repository()
+        || source.path != policy.workflow_path()
         || source.git_ref != identity.git_ref
         || github.event_name != policy.event_name
         || predicate.run_details.builder.id != identity.workflow
@@ -190,7 +192,7 @@ fn verify_provenance(
         return Err(Error::Identity);
     }
     let dependencies = &definition.resolved_dependencies;
-    let uri = format!("git+{}@{}", policy.repository, identity.git_ref);
+    let uri = format!("git+{}@{}", policy.repository(), identity.git_ref);
     if dependencies.iter().filter(|v| v.uri == uri).count() != 1
         || !dependencies
             .iter()
@@ -587,6 +589,51 @@ mod tests {
     }
 
     #[test]
+    fn semver_policy_does_not_allow_provenance_to_substitute_another_accepted_tag() {
+        let bundle: Bundle =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/provenance.sigstore.json"))
+                .unwrap();
+        let cert = certificate::parse(
+            &crypto::b64(&bundle.verification_material.certificate.raw_bytes).unwrap(),
+        )
+        .unwrap();
+        let policy = Policy::builder()
+            .semver_range("^1.0")
+            .artifact_name("measurements.json")
+            .not_after(1_792_627_200)
+            .build()
+            .unwrap();
+        let identity = certificate::identity(&cert, &policy).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&crypto::b64(&bundle.dsse_envelope.payload).unwrap()).unwrap();
+        let predicate = &value["predicate"];
+        let parsed: Provenance = serde_json::from_value(predicate.clone()).unwrap();
+        verify_provenance(&parsed, &identity, &policy).unwrap();
+        for (pointer, replacement) in [
+            (
+                "/buildDefinition/externalParameters/workflow/ref",
+                String::from("refs/tags/v1.1.0"),
+            ),
+            (
+                "/runDetails/builder/id",
+                policy.workflow_identity("refs/tags/v1.1.0"),
+            ),
+            (
+                "/buildDefinition/resolvedDependencies/0/uri",
+                format!("git+{}@refs/tags/v1.1.0", policy.repository()),
+            ),
+        ] {
+            let mut changed = predicate.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement.into();
+            let parsed: Provenance = serde_json::from_value(changed).unwrap();
+            assert_eq!(
+                verify_provenance(&parsed, &identity, &policy),
+                Err(Error::Identity)
+            );
+        }
+    }
+
+    #[test]
     fn configurable_identity_constraints_also_apply_to_provenance() {
         let bundle: Bundle =
             serde_json::from_slice(include_bytes!("../tests/fixtures/provenance.sigstore.json"))
@@ -605,7 +652,7 @@ mod tests {
             .not_after(1_792_627_200)
             .build()
             .unwrap();
-        let identity = certificate::Identity {
+        let identity = certificate::VerifiedWorkflowIdentity {
             source_revision: "d8525fb042f3ad96f3f7bfb481138b3661f282bf".into(),
             git_ref: "refs/heads/release/1.x".into(),
             workflow: policy.workflow_identity("refs/heads/release/1.x"),

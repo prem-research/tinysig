@@ -3,7 +3,7 @@
 //! Like the GitHub path, this module is `no_std` + `alloc` and builds for
 //! WebAssembly. The caller supplies an
 //! authenticated Sigstore TrustedRoot, the exact artifact bytes (or their
-//! SHA-256), an exact certificate identity and issuer, and a trusted upper time
+//! SHA-256), an expected signer [`Identity`], and a trusted upper time
 //! bound. This path authenticates a signer and artifact; application-specific
 //! attestation statements still need their own authorization checks.
 
@@ -11,7 +11,7 @@ mod rekor;
 mod sct;
 
 use crate::{
-    Envelope, Error, Timestamp,
+    Envelope, Error, Identity, Timestamp,
     certificate::{self, Authority, CODE_SIGNING, RawCertificate},
     crypto,
     error::Result,
@@ -121,22 +121,21 @@ impl PublicVerifier {
 
     /// Verify exact artifact bytes against a public Sigstore bundle.
     ///
-    /// `identity` is the exact certificate SAN (URI or email), `issuer` the exact
-    /// OIDC issuer, and `not_after` an inclusive Unix-seconds bound from a trusted
-    /// clock or release policy. No platform clock is read.
+    /// `identity` pins the certificate SAN and OIDC issuer, optionally allowing
+    /// a semver range for a workflow's release tags. `not_after` is an inclusive
+    /// Unix-seconds bound from a trusted clock or release policy. No platform
+    /// clock is read. A range does not enforce freshness or prevent rollback.
     pub fn verify(
         &self,
         artifact: &[u8],
         bundle_json: &[u8],
-        identity: &str,
-        issuer: &str,
+        identity: &Identity,
         not_after: u64,
     ) -> Result<PublicVerifiedArtifact> {
         self.verify_digest(
             Sha256::digest(artifact).into(),
             bundle_json,
             identity,
-            issuer,
             not_after,
         )
     }
@@ -148,13 +147,9 @@ impl PublicVerifier {
         &self,
         digest: [u8; 32],
         bundle_json: &[u8],
-        identity: &str,
-        issuer: &str,
+        identity: &Identity,
         not_after: u64,
     ) -> Result<PublicVerifiedArtifact> {
-        if identity.is_empty() || issuer.is_empty() {
-            return Err(Error::Policy);
-        }
         if bundle_json.len() > MAX_JSON_BYTES {
             return Err(Error::Limit);
         }
@@ -187,7 +182,7 @@ impl PublicVerifier {
             .raw_bytes,
         )?;
         let leaf = certificate::parse(&leaf_der)?;
-        check_identity(&leaf, identity, issuer)?;
+        check_identity(&leaf, identity)?;
         let key = &leaf.tbs_certificate.subject_public_key_info;
 
         let (signature, content, dsse_payload) =
@@ -277,18 +272,18 @@ impl PublicVerifier {
     }
 }
 
-/// The single SAN must equal `identity`; the Fulcio issuer extension `issuer`.
-fn check_identity(leaf: &Certificate, identity: &str, issuer: &str) -> Result<()> {
+/// The single SAN and Fulcio issuer extension must satisfy the expected identity.
+fn check_identity(leaf: &Certificate, identity: &Identity) -> Result<()> {
     let sans = leaf
         .tbs_certificate
         .get::<SubjectAltName>()?
         .ok_or(Error::Identity)?
         .1;
-    match sans.0.as_slice() {
-        [GeneralName::UniformResourceIdentifier(name)] if name.as_str() == identity => (),
-        [GeneralName::Rfc822Name(name)] if name.as_str() == identity => (),
+    let subject = match sans.0.as_slice() {
+        [GeneralName::UniformResourceIdentifier(name)] => name.as_str(),
+        [GeneralName::Rfc822Name(name)] => name.as_str(),
         _ => return Err(Error::Identity),
-    }
+    };
     let extension = |number: &str| {
         let id = ObjectIdentifier::new(number).ok()?;
         leaf.tbs_certificate
@@ -310,7 +305,7 @@ fn check_identity(leaf: &Certificate, identity: &str, issuer: &str) -> Result<()
         (_, Some(name)) | (Some(name), None) => name,
         (None, None) => return Err(Error::Identity),
     };
-    if found != issuer {
+    if !identity.matches(subject, found) {
         return Err(Error::Identity);
     }
     Ok(())
@@ -776,6 +771,14 @@ mod tests {
     const IDENTITY: &str = "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main";
     const ISSUER: &str = "https://token.actions.githubusercontent.com";
 
+    fn expected(subject: &str, issuer: &str) -> Identity {
+        Identity::builder()
+            .subject(subject)
+            .oidc_issuer(issuer)
+            .build()
+            .unwrap()
+    }
+
     fn set_extension(cert: &mut Certificate, id: &str, value: Option<&[u8]>) {
         let extensions = cert.tbs_certificate.extensions.as_mut().unwrap();
         let id = crypto::oid(id);
@@ -792,22 +795,62 @@ mod tests {
     }
 
     #[test]
+    fn workflow_range_checks_the_certificate_san_not_bundle_claims() {
+        use x509_cert::ext::AsExtension;
+        let mut cert = leaf();
+        let identity = Identity::builder()
+            .repository("sigstore-conformance/extremely-dangerous-public-oidc-beacon")
+            .workflow_path(".github/workflows/extremely-dangerous-oidc-beacon.yml")
+            .semver_range("^1.2")
+            .build()
+            .unwrap();
+        let workflow = IDENTITY.split_once('@').unwrap().0;
+        for (git_ref, accepted) in [
+            ("refs/tags/v1.2.0", true),
+            ("refs/tags/v1.3.0", true),
+            ("refs/tags/v2.0.0", false),
+            ("refs/tags/v1.3.0-rc.1", false),
+            ("refs/heads/v1.3.0", false),
+        ] {
+            let subject = alloc::format!("{workflow}@{git_ref}");
+            let san = SubjectAltName(alloc::vec![GeneralName::UniformResourceIdentifier(
+                der::asn1::Ia5String::new(&subject).unwrap(),
+            )])
+            .to_extension(&cert.tbs_certificate.subject, &[])
+            .unwrap();
+            *cert
+                .tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|e| e.extn_id == crypto::oid("2.5.29.17"))
+                .unwrap() = san;
+            assert_eq!(
+                check_identity(&cert, &identity).is_ok(),
+                accepted,
+                "{git_ref}"
+            );
+        }
+    }
+
+    #[test]
     fn identity_requires_one_exact_san_and_consistent_issuers() {
         use der::Encode;
         use x509_cert::ext::AsExtension;
         let cert = leaf();
-        check_identity(&cert, IDENTITY, ISSUER).unwrap();
+        check_identity(&cert, &expected(IDENTITY, ISSUER)).unwrap();
         assert_eq!(
-            check_identity(&cert, &IDENTITY[..IDENTITY.len() - 1], ISSUER),
+            check_identity(&cert, &expected(&IDENTITY[..IDENTITY.len() - 1], ISSUER)),
             Err(Error::Identity)
         );
 
         let mut legacy_only = cert.clone();
         set_extension(&mut legacy_only, "1.3.6.1.4.1.57264.1.8", None);
-        check_identity(&legacy_only, IDENTITY, ISSUER).unwrap();
+        check_identity(&legacy_only, &expected(IDENTITY, ISSUER)).unwrap();
         set_extension(&mut legacy_only, "1.3.6.1.4.1.57264.1.1", None);
         assert_eq!(
-            check_identity(&legacy_only, IDENTITY, ISSUER),
+            check_identity(&legacy_only, &expected(IDENTITY, ISSUER)),
             Err(Error::Identity)
         );
 
@@ -818,7 +861,7 @@ mod tests {
             Some(b"https://evil.example"),
         );
         assert_eq!(
-            check_identity(&conflicting, IDENTITY, ISSUER),
+            check_identity(&conflicting, &expected(IDENTITY, ISSUER)),
             Err(Error::Identity)
         );
         let mut current = cert.clone();
@@ -828,7 +871,7 @@ mod tests {
             .unwrap();
         set_extension(&mut current, "1.3.6.1.4.1.57264.1.1", None);
         set_extension(&mut current, "1.3.6.1.4.1.57264.1.8", Some(&evil));
-        check_identity(&current, IDENTITY, "https://evil.example").unwrap();
+        check_identity(&current, &expected(IDENTITY, "https://evil.example")).unwrap();
 
         let email = "signer@example.com";
         let sans = |names: alloc::vec::Vec<GeneralName>| {
@@ -849,21 +892,31 @@ mod tests {
         let mailbox = GeneralName::Rfc822Name(der::asn1::Ia5String::new(email).unwrap());
         let uri =
             GeneralName::UniformResourceIdentifier(der::asn1::Ia5String::new(IDENTITY).unwrap());
-        check_identity(&sans(alloc::vec![mailbox.clone()]), email, ISSUER).unwrap();
+        check_identity(
+            &sans(alloc::vec![mailbox.clone()]),
+            &expected(email, ISSUER),
+        )
+        .unwrap();
         // An email SAN matches only its exact address, never a URI identity.
         for wrong in ["other@example.com", "Signer@example.com", IDENTITY] {
             assert_eq!(
-                check_identity(&sans(alloc::vec![mailbox.clone()]), wrong, ISSUER),
+                check_identity(
+                    &sans(alloc::vec![mailbox.clone()]),
+                    &expected(wrong, ISSUER)
+                ),
                 Err(Error::Identity),
                 "{wrong}"
             );
         }
         assert_eq!(
-            check_identity(&sans(alloc::vec![uri.clone()]), email, ISSUER),
+            check_identity(&sans(alloc::vec![uri.clone()]), &expected(email, ISSUER)),
             Err(Error::Identity)
         );
         assert_eq!(
-            check_identity(&sans(alloc::vec![uri, mailbox]), IDENTITY, ISSUER),
+            check_identity(
+                &sans(alloc::vec![uri, mailbox]),
+                &expected(IDENTITY, ISSUER)
+            ),
             Err(Error::Identity)
         );
     }

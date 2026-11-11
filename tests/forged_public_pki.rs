@@ -12,7 +12,7 @@ use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tinysig::{Error, public::PublicVerifier};
+use tinysig::{Error, Identity, public::PublicVerifier};
 use x509_cert::{
     Certificate, TbsCertificate, Version,
     ext::{
@@ -38,6 +38,14 @@ const ISSUER: &str = "https://token.actions.githubusercontent.com";
 const EARLY: &str = "2000-01-01T00:00:00Z";
 const ROOT_NAME: &str = "CN=Test Root,O=forged";
 const INTER_NAME: &str = "CN=Test Intermediate,O=forged";
+
+fn identity() -> Identity {
+    Identity::builder()
+        .subject(IDENTITY)
+        .oidc_issuer(ISSUER)
+        .build()
+        .unwrap()
+}
 
 fn oid(s: &str) -> ObjectIdentifier {
     ObjectIdentifier::new_unwrap(s)
@@ -372,8 +380,7 @@ fn verify(root: &Value, bundle: &Value) -> Result<Vec<u64>, Error> {
         .verify(
             ARTIFACT,
             &serde_json::to_vec(bundle).unwrap(),
-            IDENTITY,
-            ISSUER,
+            &identity(),
             NOT_AFTER,
         )
         .map(|result| result.signed_at_unix_seconds)
@@ -469,8 +476,7 @@ fn forged_pki_baseline_verifies_with_inclusive_leaf_validity() {
             .verify(
                 ARTIFACT,
                 &serde_json::to_vec(&f.bundle(&leaf, T0 + 5)).unwrap(),
-                IDENTITY,
-                ISSUER,
+                &identity(),
                 T0 + 4
             ),
         Err(Error::Timestamp)

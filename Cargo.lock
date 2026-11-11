@@ -462,6 +462,7 @@ dependencies = [
  "ed25519-dalek",
  "p256",
  "p384",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
