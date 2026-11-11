@@ -55,3 +55,33 @@ impl From<serde_json::Error> for Error {
 }
 
 pub(crate) type Result<T> = core::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use alloc::{collections::BTreeSet, string::ToString};
+
+    #[test]
+    fn every_error_has_a_distinct_message() {
+        let messages: BTreeSet<_> = [
+            Error::Policy,
+            Error::Limit,
+            Error::Encoding,
+            Error::Unsupported,
+            Error::Trust,
+            Error::Signature,
+            Error::Timestamp,
+            Error::Identity,
+            Error::Artifact,
+        ]
+        .iter()
+        .map(|error| {
+            let message = error.to_string();
+            assert!(!message.is_empty(), "{error:?}");
+            message
+        })
+        .collect();
+        assert_eq!(messages.len(), 9);
+        assert_eq!(Error::Signature.to_string(), "invalid signature");
+    }
+}

@@ -1,4 +1,4 @@
-// Build first: cargo build -p trustbase-sigstore --example wasm_smoke --target wasm32-unknown-unknown --release
+// Build first: cargo build --example wasm_smoke --target wasm32-unknown-unknown --release
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 

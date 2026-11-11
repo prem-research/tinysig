@@ -435,7 +435,9 @@ Tests cover a real GitHub attestation fixture, byte-for-byte upstream Sigstore
 conformance bundles (production Rekor v1 and staging Rekor v2, with DSSE and
 message signatures, plus malformed log/envelope cases), and tampered artifacts,
 payloads, signatures, timestamps, checkpoints, log IDs, and trust-root windows.
-Synthetically re-signed certificates and timestamps test failure paths. Fixtures
+Synthetically re-signed certificates and timestamps test failure paths, and
+`tests/forged_public_pki.rs` mints public-path bundles under a test-only Fulcio
+chain, CT log, and Rekor log to break one invariant at a time. Fixtures
 use expired short-lived certificates intentionally: authenticated signing-time
 validation keeps historical artifacts verifiable. Fixture provenance is recorded
 in [`tests/fixtures/README.md`](tests/fixtures/README.md) and

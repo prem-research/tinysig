@@ -276,9 +276,26 @@ pub(crate) fn verify(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::TrustedRoot;
+
+    /// The fixture token re-issued by the test TSA over `signature`.
+    pub(crate) fn resigned_for(
+        signature: &[u8],
+        roots: &TrustedRoot,
+        key: &p384::ecdsa::SigningKey,
+    ) -> Vec<u8> {
+        let (mut response, _) = fixture();
+        let mut info =
+            TstInfo::from_der(response.token.content.content.content.as_bytes()).unwrap();
+        info.message_imprint.hashed_message =
+            OctetString::new(crypto::hash(&info.message_imprint.algorithm, signature).unwrap())
+                .unwrap();
+        response.token.content.content.content = OctetString::new(info.to_der().unwrap()).unwrap();
+        resign(&mut response, roots, key, true);
+        response.to_der().unwrap()
+    }
 
     fn fixture() -> (Response, Vec<u8>) {
         let bundle: crate::Bundle =
@@ -423,6 +440,376 @@ mod tests {
                 1_792_627_200,
                 false
             ),
+            Err(Error::Trust)
+        );
+    }
+
+    #[test]
+    fn every_cms_profile_field_is_checked_on_its_own() {
+        // These fields sit outside the CMS signature, so the profile check is
+        // the only thing that rejects them.
+        let roots =
+            TrustedRoot::from_json(include_bytes!("../tests/fixtures/github-trusted-root.json"))
+                .unwrap();
+        let (response, signature) = fixture();
+        let check = |change: &dyn Fn(&mut Response), expected: Error| {
+            let mut changed = response.clone();
+            change(&mut changed);
+            assert_eq!(
+                verify(
+                    &changed.to_der().unwrap(),
+                    &signature,
+                    &roots.tsa,
+                    1_792_627_200,
+                    false
+                ),
+                Err(expected),
+                "{:?} {:?} {} {:?} signers={} digests={} v={} {:?} {:?}",
+                changed.status,
+                changed.token.content_type,
+                changed.token.content.version,
+                changed.token.content.content.content_type,
+                changed.token.content.signer_infos.len(),
+                changed.token.content.digest_algorithms.len(),
+                changed.token.content.signer_infos.get(0).unwrap().version,
+                changed
+                    .token
+                    .content
+                    .signer_infos
+                    .get(0)
+                    .unwrap()
+                    .signature_algorithm
+                    .oid,
+                changed
+                    .token
+                    .content
+                    .signer_infos
+                    .get(0)
+                    .unwrap()
+                    .digest_algorithm
+                    .oid,
+            );
+        };
+        check(&|r| r.status.status = 2, Error::Unsupported);
+        check(
+            &|r| r.status.status_string = Some(Vec::new()),
+            Error::Unsupported,
+        );
+        check(
+            &|r| r.status.fail_info = Some(BitString::from_bytes(&[0]).unwrap()),
+            Error::Unsupported,
+        );
+        check(&|r| r.token.content_type = TST_INFO, Error::Unsupported);
+        check(&|r| r.token.content.version = 1, Error::Unsupported);
+        check(
+            &|r| r.token.content.content.content_type = SIGNED_DATA,
+            Error::Unsupported,
+        );
+        check(
+            &|r| {
+                let signer = r.token.content.signer_infos.get(0).unwrap().clone();
+                let mut other = signer.clone();
+                other.version = 3;
+                r.token.content.signer_infos =
+                    SetOfVec::try_from(alloc::vec![signer, other]).unwrap();
+            },
+            Error::Unsupported,
+        );
+        check(
+            &|r| {
+                let mut algorithms: Vec<_> =
+                    r.token.content.digest_algorithms.iter().cloned().collect();
+                algorithms.push(AlgorithmIdentifierOwned {
+                    oid: oid("2.16.840.1.101.3.4.2.2"),
+                    parameters: None,
+                });
+                r.token.content.digest_algorithms = SetOfVec::try_from(algorithms).unwrap();
+            },
+            Error::Unsupported,
+        );
+        // Signer version and algorithm pairing are inside SignerInfo but outside
+        // the signed attributes; they must be rejected before any signature check.
+        check(
+            &|r| {
+                let mut signer = r.token.content.signer_infos.get(0).unwrap().clone();
+                signer.version = 3;
+                r.token.content.signer_infos = SetOfVec::try_from(alloc::vec![signer]).unwrap();
+            },
+            Error::Unsupported,
+        );
+        check(
+            &|r| {
+                let mut signer = r.token.content.signer_infos.get(0).unwrap().clone();
+                signer.signature_algorithm.oid = oid("1.2.840.10045.4.3.2"); // SHA-256 pairing with a SHA-384 digest
+                r.token.content.signer_infos = SetOfVec::try_from(alloc::vec![signer]).unwrap();
+            },
+            Error::Unsupported,
+        );
+        check(
+            &|r| {
+                let mut signer = r.token.content.signer_infos.get(0).unwrap().clone();
+                signer.digest_algorithm.oid = oid("2.16.840.1.101.3.4.2.1"); // differs from digestAlgorithms
+                r.token.content.signer_infos = SetOfVec::try_from(alloc::vec![signer]).unwrap();
+            },
+            Error::Unsupported,
+        );
+        assert!(
+            verify(
+                &alloc::vec![0x30; 32 * 1024 + 1],
+                &signature,
+                &roots.tsa,
+                1,
+                false
+            ) == Err(Error::Limit)
+        );
+    }
+
+    #[test]
+    fn signed_attributes_must_be_unique_single_valued_and_known() {
+        let (roots, key) = crate::certificate::test_roots();
+        let (response, signature) = fixture();
+        let attributes: Vec<_> = response
+            .token
+            .content
+            .signer_infos
+            .get(0)
+            .unwrap()
+            .signed_attributes
+            .iter()
+            .cloned()
+            .collect();
+        let with = |edit: &dyn Fn(&mut Vec<x509_cert::attr::Attribute>)| {
+            let mut changed = response.clone();
+            let mut attributes = attributes.clone();
+            edit(&mut attributes);
+            let mut signer = changed.token.content.signer_infos.get(0).unwrap().clone();
+            signer.signed_attributes = SetOfVec::try_from(attributes).unwrap();
+            changed.token.content.signer_infos = SetOfVec::try_from(alloc::vec![signer]).unwrap();
+            resign(&mut changed, &roots, &key, true);
+            verify(
+                &changed.to_der().unwrap(),
+                &signature,
+                &roots.tsa,
+                1_792_627_200,
+                false,
+            )
+        };
+        assert!(with(&|_| {}).is_ok());
+        // A duplicate attribute cannot be built as a `SetOfVec`; `der` rejects
+        // duplicate SET elements at decode time, which the uniqueness loop in
+        // `verify` backs up.
+        // Multi-valued attribute.
+        assert_eq!(
+            with(&|a| {
+                let value = a[0].values.get(0).unwrap().clone();
+                let mut values: Vec<_> = a[0].values.iter().cloned().collect();
+                values.push(
+                    Any::from_der(
+                        &OctetString::new(value.to_der().unwrap())
+                            .unwrap()
+                            .to_der()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                );
+                a[0].values = SetOfVec::try_from(values).unwrap();
+            }),
+            Err(Error::Encoding)
+        );
+        // Unknown attribute, even when signed.
+        assert_eq!(
+            with(&|a| {
+                let mut unknown = a[0].clone();
+                unknown.oid = oid("1.2.840.113549.1.9.16.2.12");
+                a.push(unknown);
+            }),
+            Err(Error::Unsupported)
+        );
+        // A missing required attribute.
+        assert_eq!(
+            with(&|a| a.retain(|x| x.oid != oid("1.2.840.113549.1.9.3"))),
+            Err(Error::Timestamp)
+        );
+    }
+
+    #[test]
+    fn accuracy_signer_identifier_and_ess_issuer_are_checked() {
+        let (roots, key) = crate::certificate::test_roots();
+        let (response, signature) = fixture();
+        let with_info = |edit: &dyn Fn(&mut TstInfo)| {
+            let mut changed = response.clone();
+            let mut info =
+                TstInfo::from_der(changed.token.content.content.content.as_bytes()).unwrap();
+            edit(&mut info);
+            changed.token.content.content.content =
+                OctetString::new(info.to_der().unwrap()).unwrap();
+            resign(&mut changed, &roots, &key, true);
+            verify(
+                &changed.to_der().unwrap(),
+                &signature,
+                &roots.tsa,
+                1_792_627_200,
+                false,
+            )
+        };
+        let accuracy = |seconds, millis, micros| Accuracy {
+            seconds,
+            millis,
+            micros,
+        };
+        assert!(with_info(&|i| i.accuracy = Some(accuracy(Some(1), Some(1), Some(999)))).is_ok());
+        assert!(with_info(&|i| i.accuracy = Some(accuracy(None, None, None))).is_ok());
+        for (name, bad) in [
+            ("seconds", accuracy(Some(2), None, None)),
+            ("millis low", accuracy(None, Some(0), None)),
+            ("millis high", accuracy(None, Some(1000), None)),
+            ("micros low", accuracy(None, None, Some(0))),
+            ("micros high", accuracy(None, None, Some(1000))),
+        ] {
+            assert_eq!(
+                with_info(&|i| i.accuracy = Some(bad.clone())),
+                Err(Error::Unsupported),
+                "{name}"
+            );
+        }
+        assert_eq!(with_info(&|i| i.version = 2), Err(Error::Timestamp));
+
+        let with_signer = |edit: &dyn Fn(&mut SignerInfo), bind: bool| {
+            let mut changed = response.clone();
+            let mut signer = changed.token.content.signer_infos.get(0).unwrap().clone();
+            edit(&mut signer);
+            changed.token.content.signer_infos = SetOfVec::try_from(alloc::vec![signer]).unwrap();
+            resign(&mut changed, &roots, &key, bind);
+            verify(
+                &changed.to_der().unwrap(),
+                &signature,
+                &roots.tsa,
+                1_792_627_200,
+                false,
+            )
+        };
+        assert!(with_signer(&|_| {}, true).is_ok());
+        assert_eq!(
+            with_signer(&|s| s.sid.serial = SerialNumber::new(&[1]).unwrap(), true),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            with_signer(&|s| s.sid.issuer = Name::default(), true),
+            Err(Error::Trust)
+        );
+
+        // ESS issuerSerial, when present, must name the pinned leaf too.
+        let leaf = &roots.tsa.last().unwrap().chain[0];
+        let with_ess = |edit: &dyn Fn(&mut EssCertId)| {
+            let mut changed = response.clone();
+            let mut signer = changed.token.content.signer_infos.get(0).unwrap().clone();
+            let mut attributes: Vec<_> = signer.signed_attributes.iter().cloned().collect();
+            for attribute in &mut attributes {
+                if attribute.oid == oid("1.2.840.113549.1.9.16.2.47") {
+                    let mut binding = attribute
+                        .values
+                        .get(0)
+                        .unwrap()
+                        .decode_as::<SigningCertificateV2>()
+                        .unwrap();
+                    edit(&mut binding.certs[0]);
+                    attribute.values = SetOfVec::try_from(alloc::vec![
+                        Any::from_der(&binding.to_der().unwrap()).unwrap()
+                    ])
+                    .unwrap();
+                }
+            }
+            signer.signed_attributes = SetOfVec::try_from(attributes).unwrap();
+            changed.token.content.signer_infos = SetOfVec::try_from(alloc::vec![signer]).unwrap();
+            // `resign` with `bind` recomputes only the hash, keeping issuerSerial.
+            resign(&mut changed, &roots, &key, true);
+            verify(
+                &changed.to_der().unwrap(),
+                &signature,
+                &roots.tsa,
+                1_792_627_200,
+                false,
+            )
+        };
+        let issuer_serial = |issuer: GeneralName, serial: SerialNumber| EssIssuerSerial {
+            issuer: alloc::vec![issuer],
+            serial,
+        };
+        let right = GeneralName::DirectoryName(leaf.tbs_certificate.issuer.clone());
+        assert!(
+            with_ess(&|c| c.issuer_serial = Some(issuer_serial(
+                right.clone(),
+                leaf.tbs_certificate.serial_number.clone()
+            )))
+            .is_ok()
+        );
+        assert_eq!(
+            with_ess(&|c| c.issuer_serial = Some(issuer_serial(
+                right.clone(),
+                SerialNumber::new(&[1]).unwrap()
+            ))),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            with_ess(&|c| c.issuer_serial = Some(issuer_serial(
+                GeneralName::DirectoryName(Name::default()),
+                leaf.tbs_certificate.serial_number.clone()
+            ))),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            with_ess(&|c| c.hash_algorithm = Some(AlgorithmIdentifierOwned {
+                oid: oid("2.16.840.1.101.3.4.2.2"),
+                parameters: None
+            })),
+            Err(Error::Trust)
+        );
+    }
+
+    #[test]
+    fn pinned_tsa_leaf_needs_a_critical_timestamping_only_eku() {
+        use x509_cert::ext::{AsExtension, pkix::ExtendedKeyUsage};
+        let (response, signature) = fixture();
+        let with_eku = |purposes: Vec<ObjectIdentifier>, critical: bool| {
+            let (mut roots, key) = crate::certificate::test_roots();
+            let leaf = &mut roots.tsa.last_mut().unwrap().chain[0];
+            let mut extension = ExtendedKeyUsage(purposes)
+                .to_extension(&leaf.tbs_certificate.subject, &[])
+                .unwrap();
+            extension.critical = critical;
+            *leaf
+                .tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|e| e.extn_id == oid("2.5.29.37"))
+                .unwrap() = extension;
+            crate::certificate::test_sign(leaf, &key);
+            let mut changed = response.clone();
+            resign(&mut changed, &roots, &key, true);
+            verify(
+                &changed.to_der().unwrap(),
+                &signature,
+                &roots.tsa,
+                1_792_627_200,
+                false,
+            )
+        };
+        assert!(with_eku(alloc::vec![TIMESTAMPING], true).is_ok());
+        assert_eq!(
+            with_eku(alloc::vec![TIMESTAMPING], false),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            with_eku(
+                alloc::vec![TIMESTAMPING, crate::certificate::CODE_SIGNING],
+                true
+            ),
+            Err(Error::Trust)
+        );
+        assert_eq!(
+            with_eku(alloc::vec![crate::certificate::CODE_SIGNING], true),
             Err(Error::Trust)
         );
     }
