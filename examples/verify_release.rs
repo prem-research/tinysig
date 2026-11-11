@@ -5,7 +5,7 @@ use std::{
     fs,
     time::{SystemTime, UNIX_EPOCH},
 };
-use trustbase_sigstore::{Policy, TrustedRoot, verify};
+use tinysig::{Policy, TrustedRoot, verify};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args().skip(1).collect();

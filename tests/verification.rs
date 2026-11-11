@@ -1,7 +1,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use trustbase_sigstore::{Error, Policy, PolicyBuilder, TrustedRoot, verify, verify_digest};
+use tinysig::{Error, Policy, PolicyBuilder, TrustedRoot, verify, verify_digest};
 
 const ARTIFACT: &[u8] = include_bytes!("fixtures/measurements.json");
 const BUNDLE: &[u8] = include_bytes!("fixtures/provenance.sigstore.json");
